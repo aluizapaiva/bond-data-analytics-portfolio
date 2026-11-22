@@ -1,0 +1,1027 @@
+---
+title: "Bank Analysis 2 - KNN and Clustering"
+author: "Ana Paiva"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    number_sections: true
+    latex_engine: xelatex
+params:
+  report_type: 
+    value: "technical" # Can be switched to "management"
+---
+# Setup and Package Management
+```{r setup_variables, include=FALSE}
+# Setting global options for all code chunks
+# Logical flags to control which content to display based on the report type
+show_technical_details <- params$report_type == "technical"
+show_management_details <- params$report_type == "management"
+
+# Set knitr options based on report type
+knitr::opts_chunk$set(
+  echo = show_technical_details,  
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 12,
+  fig.height = 8,
+  dpi = 300,
+  out.width = if(show_management_details) "70%" else "90%",
+  fig.pos = "H"
+)
+```
+
+```{r, load_libraries, message=FALSE, warning=FALSE, echo=TRUE, results='hide'}
+##' Package Management:
+
+# Function to check and install packages if they're not already installed
+load_packages <- function(packages) {
+  # Check which packages are not installed
+  not_installed <- packages[!(packages %in% installed.packages()[,"Package"])]
+  
+  # Install missing packages
+  if(length(not_installed) > 0) {
+    message("Installing missing packages: ", paste(not_installed, collapse = ", "))
+    install.packages(not_installed, repos = "https://cran.rstudio.com/")
+  }
+  
+  # Load all packages
+  for(pkg in packages) {
+    library(pkg, character.only = TRUE)
+    message(paste("Loaded package:", pkg))
+  }
+}
+
+# List of required packages for the analysis
+required_packages <- c(
+"tidyverse",     # Core data science packages: ggplot2, dplyr, tidyr, readr, purrr
+"caret",         # Unified interface to train models and use resampling
+"cluster",       # Clustering algorithms and silhouette width
+"factoextra",    # Visualize clustering results beautifully
+"dendextend",    # Dendrogram enhancement for hierarchical clustering
+"clue",          # Tools for comparing clustering solutions
+"kableExtra",    # Better tables in RMarkdown
+"gridExtra",     # Arrange multiple ggplot2 plots
+"dbscan",        # Density-based clustering
+"knitr",         # For table formatting
+"class",         # For classification methods in KNN
+"gridExtra",     # arrange multiple grid-based plots
+"lintr",         # code style and best practices and consistent styling
+"pROC",          # Display and Analyze ROC Curves
+"scales",        # Scale Functions for Visualization
+"data.table",    # For efficient data handling
+"readr",         # For reading CSV files
+"kknn")          # Weighted k-Nearest Neighbors
+
+# Load all required packages
+load_packages(required_packages)
+
+# Note: GAI was used on the coding, plotting and debugging part.
+# The majority of the structure, data clean and modeling came from our workshops. 
+```
+
+# Introduction
+```{r intro_text, results='asis', echo=FALSE}
+if (params$report_type == "technical") {
+  cat("
+## Technical Introduction
+
+This technical report presents a comprehensive evaluation of **K-Nearest Neighbors (KNN)** classification and clustering techniques applied to the Adult Income dataset.
+
+The objective is twofold:  
+1. Build a robust KNN model to predict whether individuals earn more than 50K annually.  
+2. Uncover natural customer segments using clustering to support targeted marketing strategies.
+
+These analysis will help the bank identify potential high-value customers and understand meaningful patterns in their customer base for more effective service offerings.
+  ")
+} else if (params$report_type == "management") {
+  cat("
+## Executive Summary
+
+* These analysis helps the bank **identify high-value customers** and **discover natural customer segments**
+* Our best model achieves **82% accuracy** in predicting which customers earn over $50K annually
+")
+}
+```
+
+# Data Loading and Preprocessing
+```{r data_loading, eval=params$report_type == "technical", echo=TRUE, results='asis'}
+
+read_csv("data/adult_train.csv")
+read_csv("data/adult_test.csv")
+
+# Define column names based on the dataset description
+column_names <- c("age", "workclass", "fnlwgt", "education", "education_num", 
+                 "marital_status", "occupation", "relationship", "race", 
+                 "sex", "capital_gain", "capital_loss", "hours_per_week", 
+                 "native_country", "income")
+
+# Read training data with proper column names
+train_data <- read_csv("data/adult_train.csv", 
+                      col_names = column_names, 
+                      trim_ws = TRUE, 
+                      na = c("", "NA", "?", " ?"),
+                      show_col_types = FALSE)
+
+# The test file has a header row to remove
+test_data <- readLines("data/adult_test.csv")
+
+# Skip the first line (header) and write to a temporary file
+# writeLines(test_data[-1], "data/bank_analysis/adult_test.csv")
+
+# Read TEST data with proper column names
+test_data <- read_csv("data/bank_analysis/adult_test.csv", 
+                      col_names = column_names, 
+                      trim_ws = TRUE, 
+                      na = c("", "NA", "?", " ?"),  
+                      show_col_types = FALSE)
+
+# Fix the income column in test data (it has a period at the end)
+test_data$income <- gsub("\\.", "", test_data$income)
+
+# Check dimensions of both datasets
+cat("Training data dimensions:", dim(train_data)[1], "rows,", dim(train_data)[2], "columns\n")
+cat("Test data dimensions:", dim(test_data)[1], "rows,", dim(test_data)[2], "columns\n")
+```
+
+```{r preprocessing, eval=params$report_type == "technical", echo=TRUE, results='asis'}
+# Data preprocessing steps
+# Check the structure of both datasets
+str(train_data)
+str(test_data)
+
+# Combine datasets for consistent preprocessing
+# Add a column to identify the source
+train_data$source <- "train"
+test_data$source <- "test"
+combined_data <- rbind(train_data, test_data)
+
+# Clean up the income variable (remove spaces and periods)
+combined_data$income <- gsub(" ", "", combined_data$income)
+combined_data$income <- gsub("\\.", "", combined_data$income)
+
+# Convert income to a factor with consistent levels
+combined_data$income <- factor(combined_data$income, 
+                               levels = c("<=50K", ">50K"))
+
+# Handle missing values (marked as "?")
+# For factor variables: replace "?" with "Unknown"
+combined_data <- combined_data %>%
+  mutate_if(is.character, function(x) ifelse(x == "?", "Unknown", x))
+
+# Identify numeric columns
+numeric_cols <- c("age", "fnlwgt", "education_num", "capital_gain", 
+                 "capital_loss", "hours_per_week")
+
+# For numeric columns, replace "?" with NA
+for (col in numeric_cols) {
+  combined_data[[col]] <- as.numeric(as.character(combined_data[[col]]))
+}
+
+# Remove rows with NA values - following the workshop practice
+combined_data <- na.omit(combined_data)
+
+# Convert character columns to factors
+combined_data <- combined_data %>%
+  mutate_if(is.character, as.factor)
+
+# Normalize numeric variables (following Workshop 9 example)
+normalize <- function(x) { (x-min(x)) / (max(x)-min(x)) }
+
+# Identify numeric columns (excluding source which is our identifier)
+numeric_cols <- c("age", "fnlwgt", "education_num", "capital_gain", 
+                 "capital_loss", "hours_per_week")
+
+# Normalize numeric columns
+combined_data[numeric_cols] <- lapply(combined_data[numeric_cols], normalize)
+
+# Split back into train and test datasets
+train_clean <- combined_data %>% filter(source == "train") %>% select(-source)
+test_clean <- combined_data %>% filter(source == "test") %>% select(-source)
+
+# Verify the distribution of income in both datasets
+summary(train_clean$income)/nrow(train_clean)
+summary(test_clean$income)/nrow(test_clean)
+
+# Look for any remaining issues
+anyNA(train_clean)
+anyNA(test_clean)
+
+# Save the cleaned datasets
+write.csv(train_clean, "train_clean.csv", row.names = FALSE)
+write.csv(test_clean, "test_clean.csv", row.names = FALSE)
+
+# Create datasets for clustering (without income column)
+train_cluster <- train_clean %>% select(-income)
+test_cluster <- test_clean %>% select(-income)
+
+# Save datasets ready for clustering
+write.csv(train_cluster, "train_cluster.csv", row.names = FALSE)
+write.csv(test_cluster, "test_cluster.csv", row.names = FALSE)
+```
+
+## KNN Classifications 
+```{r 1st_knn, eval=params$report_type == "technical", echo=TRUE, results='asis'}
+# KNN Classification Model
+# -------------------------
+# Sample the data for efficiency
+# Set a seed for reproducibility
+set.seed(123)
+train_sample <- train_clean %>% 
+  sample_frac(0.50)  # Use 50% of the training data for initial models
+
+# KNN Model 1: Basic KNN with default parameters
+set.seed(123)
+knn_model1 <- train(
+  form = income ~ .,
+  data = train_sample,
+  method = 'knn',
+  trControl = trainControl(
+    method = 'cv',
+    number = 5,
+    verboseIter = TRUE
+  )
+)
+
+# View model results
+print(knn_model1)
+plot(knn_model1)
+# Following Workshop 9 examples to build and evaluate KNN models
+
+```
+
+```{r 2nd_knn, eval=params$report_type == "technical", echo=TRUE, results='asis'}
+# KNN Model 2: KNN with expanded k values 
+# -------------------------
+# Set a seed for reproducibility
+set.seed(123)
+knn_model2 <- train(
+  form = income ~ .,
+  data = train_sample,
+  method = 'knn',
+  tuneGrid = expand.grid(.k = seq(5, 25, by = 2)),  # Odd k values from 5 to 25
+  metric = 'Accuracy',
+  trControl = trainControl(
+    method = 'cv',
+    number = 5,
+    verboseIter = TRUE
+  )
+)
+
+# View results
+print(knn_model2)
+plot(knn_model2)
+```
+
+```{r 3rd_knn, eval=params$report_type == "technical", echo=TRUE, results='asis'}
+# KNN Model 3: KNN with preprocessing (center and scale)
+# -------------------------
+set.seed(123)
+knn_model3 <- train(
+  form = income ~ .,
+  data = train_sample,
+  method = 'knn',
+  preProcess = c("center", "scale"),  # Standardize variables as in Workshop 9
+  tuneGrid = expand.grid(.k = seq(5, 25, by = 5)),
+  metric = 'Accuracy',
+  trControl = trainControl(
+    method = 'cv',
+    number = 5,
+    verboseIter = TRUE
+  )
+)
+
+# View results
+print(knn_model3)
+plot(knn_model3)
+```
+
+```{r 4th_knn, eval=params$report_type == "technical", echo=TRUE, results='asis'}
+# KNN Model 4:  KNN with a different metric (recall)
+# -------------------------
+# Set a seed for reproducibility
+set.seed(123)
+knn_model4 <- train(
+  form = income ~ .,
+  data = train_sample,
+  method = 'knn',
+  preProcess = c("center", "scale"),
+  tuneGrid = expand.grid(.k = seq(5, 25, by = 5)),
+  metric = 'Sensitivity',  # Use built-in sensitivity metric instead
+  trControl = trainControl(
+    method = 'cv',
+    number = 5,
+    verboseIter = TRUE
+  )
+)
+
+# View results
+print(knn_model4)
+plot(knn_model4)
+```
+
+```{r 5th_knn, eval=params$report_type == "technical", echo=TRUE, results='asis'}
+# KNN Model 5: Weighted KNN (kknn)
+# -------------------------
+set.seed(123)
+knn_model5 <- train(
+  form = income ~ .,
+  data = train_sample,
+  method = 'knn', # Weighted KNN as in Workshop 9
+  tuneGrid = expand.grid(.k = seq(5, 25, by = 5)),  # Same k values as other models
+  metric = 'Accuracy',
+  trControl = trainControl(
+    method = 'cv',
+    number = 5,
+    verboseIter = TRUE
+  )
+)
+
+# View results
+print(knn_model5)
+plot(knn_model5)
+
+```
+
+
+```{r knn_sum_table, eval=params$report_type == "technical", echo=TRUE, results='always'}
+# Evaluate all models on test set
+# Create function to evaluate models
+evaluate_model <- function(model, test_data, model_name, accuracy_label) {
+  # Predict on test data
+  predictions <- predict(model, newdata = test_data)
+  
+  # Calculate confusion matrix
+  cm <- confusionMatrix(predictions, test_data$income, positive = ">50K")
+  
+  # Extract metrics
+  accuracy <- cm$overall["Accuracy"]
+  precision <- cm$byClass["Pos Pred Value"]
+  recall <- cm$byClass["Sensitivity"]
+  
+  # Get best k value directly from the final model
+  best_k <- model$finalModel$k
+  
+  # Return as data frame row
+  data.frame(
+    AccuracyLabel = accuracy_label,
+    Model = model_name,
+    Best_k = best_k,
+    Accuracy = accuracy,
+    Precision = precision,
+    Recall = recall
+  )
+}
+
+# List of models, names and accuracy labels
+models <- list(knn_model1, knn_model2, knn_model3, knn_model4, knn_model5)
+model_names <- c("Basic KNN", "Extended value KNN", "KNN with preprocessing Center and scale", 
+                "Recall KNN", "Weighted KNN")
+accuracy_labels <- c("Accuracy1", "Accuracy2", "Accuracy3", "Accuracy4", "Accuracy5")
+
+# Evaluate each model
+results_list <- lapply(1:length(models), function(i) {
+  evaluate_model(models[[i]], test_clean, model_names[i], accuracy_labels[i])
+})
+
+# Combine results
+knn_results <- do.call(rbind, results_list)
+
+# Create a table for report
+knn_results_table <- knn_results %>%
+  mutate(across(where(is.numeric), ~round(., 4))) %>%
+  arrange(desc(Accuracy))
+
+# Print formatted table
+kable(knn_results_table, 
+      caption = "KNN Model Performance Comparison", 
+      format = "html") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+```{r knn_comparison_plot, fig.width=10, fig.height=6, eval=params$report_type == "technical", echo=TRUE, results='asis'}
+# Create long format data for plotting
+plot_data <- knn_results %>%
+  select(Model, Accuracy, Precision, Recall) %>%
+  gather(key = "Metric", value = "Value", -Model) %>%
+  mutate(
+    Value = round(Value, 4),
+    Model = factor(Model, levels = model_names)
+  )
+
+# Create the comparison plot
+ggplot(plot_data, aes(x = Model, y = Value, fill = Metric)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(aes(label = sprintf("%.3f", Value)), 
+            position = position_dodge(width = 0.9), 
+            vjust = -0.5,
+            size = 3) +
+  labs(
+    title = "KNN Models Performance Comparison",
+    x = "Model Type",
+    y = "Score",
+    fill = "Metric"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(hjust = 0.5, size = 14),
+    legend.position = "top"
+  ) +
+  scale_fill_brewer(palette = "Set2") +
+  ylim(0, max(plot_data$Value) + 0.1)  # Add some space for the labels
+
+# Add a horizontal line at the best accuracy
+best_accuracy <- max(knn_results$Accuracy)
+best_model <- knn_results$Model[which.max(knn_results$Accuracy)]
+
+cat("\nBest performing model:", best_model, "with accuracy:", round(best_accuracy, 4))
+```
+
+
+```{r k_comparison, fig.width=10, fig.height=6, echo=FALSE, eval=params$report_type == "management", echo=FALSE, results='always'}
+# Extract k values and accuracies from each model's tuning results
+plot_data <- rbind(
+  data.frame(
+    Model = "Basic KNN",
+    k = knn_model1$results$k,
+    Accuracy = knn_model1$results$Accuracy
+  ),
+  data.frame(
+    Model = "Extended value KNN",
+    k = knn_model2$results$k,
+    Accuracy = knn_model2$results$Accuracy
+  ),
+  data.frame(
+    Model = "KNN with preprocessing",
+    k = knn_model3$results$k,
+    Accuracy = knn_model3$results$Accuracy
+  ),
+  data.frame(
+    Model = "Recall KNN",
+    k = knn_model4$results$k,
+    Accuracy = knn_model4$results$Accuracy
+  ),
+  data.frame(
+    Model = "Weighted KNN",
+    k = knn_model5$results$k,
+    Accuracy = knn_model5$results$Accuracy
+  )
+)
+
+# Create the line plot with improved visibility
+ggplot(plot_data, aes(x = k, y = Accuracy, color = Model)) +
+  # Add background grid for readability
+  geom_hline(yintercept = seq(min(plot_data$Accuracy, na.rm = TRUE), 
+                              max(plot_data$Accuracy, na.rm = TRUE), 
+                              by = 0.005), 
+             color = "gray90", linetype = "dashed") +
+  
+  # Add thicker lines for better visibility
+  geom_line(size = 1.5) +
+  
+  # Make the weighted KNN line even thicker and brighter red
+  geom_line(data = plot_data %>% filter(Model == "Weighted KNN"),
+            aes(x = k, y = Accuracy),
+            color = "#FF0000", size = 2.5) +
+  
+  # Add larger points
+  geom_point(size = 3.5, alpha = 0.9) +
+  
+  # Highlight optimal k points with larger circles
+  geom_point(data = plot_data %>% 
+               group_by(Model) %>% 
+               filter(Accuracy == max(Accuracy)),
+             aes(x = k, y = Accuracy), 
+             size = 7, shape = 21, fill = "white", color = "black", stroke = 1.5) +
+  
+  # Add text annotations for best k values with improved visibility and positioning
+  geom_label(data = plot_data %>% 
+              group_by(Model) %>% 
+              filter(Accuracy == max(Accuracy)),
+            aes(label = sprintf("k=%d\nAcc=%.3f", k, Accuracy),
+                fill = Model),
+            vjust = -1.5, hjust = 0.5,
+            size = 4, fontface = "bold",
+            color = "black",
+            alpha = 0.9,
+            label.padding = unit(0.5, "lines"),
+            label.size = 0.5) +
+  
+  # Improved titles and labels with larger font
+  labs(
+    title = "KNN Model Performance Comparison Across Different k Values",
+    subtitle = "Comparison of five different KNN implementations with optimal k values highlighted",
+    x = "Number of Neighbors (k)",
+    y = "Cross-Validation Accuracy",
+    color = "Model Type",
+    fill = "Model Type"
+  ) +
+  
+  # Use a clean theme with improved aesthetics and larger fonts
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 18, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, size = 14, color = "gray30"),
+    legend.position = "right",
+    legend.title = element_text(size = 14, face = "bold"),
+    legend.text = element_text(size = 12),
+    legend.key.size = unit(1.5, "cm"),
+    axis.title = element_text(size = 14, face = "bold"),
+    axis.text = element_text(size = 12, face = "bold"),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "gray80", fill = NA, size = 1)
+  ) +
+  
+  # Custom color palette with brighter colors for better visibility
+  scale_color_manual(values = c("#1E90FF", "#00CD66", "#9932CC", "#FFA500", "#FF0000")) +
+  scale_fill_manual(values = c("#1E90FF", "#00CD66", "#9932CC", "#FFA500", "#FF0000"),
+                   guide = "none") +
+  
+  # Ensure y-axis shows enough precision
+  scale_y_continuous(labels = scales::number_format(accuracy = 0.001),
+                    limits = c(min(plot_data$Accuracy) - 0.002, 
+                              max(plot_data$Accuracy) + 0.005))
+```
+
+## Best k values for each model
+```{r best_k_table, eval=params$report_type == "technical", echo=TRUE, results='always'}
+
+# Create and print a summary table of best k values with enhanced styling
+best_k_table <- plot_data %>%
+  group_by(Model) %>%
+  filter(Accuracy == max(Accuracy)) %>%
+  arrange(desc(Accuracy)) %>%
+  select(Model, k, Accuracy)
+
+# Create enhanced table with kableExtra
+kable(best_k_table, digits = 4, format = "html", 
+      caption = "<strong>Summary of Optimal k Values and Their Corresponding Accuracies</strong>") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE,
+                position = "center",
+                font_size = 14) %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4E79A7") %>%
+  row_spec(1, bold = TRUE, background = "#F2F2F2", color = "#FF0000") %>%  # Highlight best model
+  column_spec(1, bold = TRUE) %>%
+  column_spec(2, width = "100px") %>%
+  column_spec(3, width = "150px", background = "#F8F8F8")
+```
+
+```{r knn_conclusion, include=show_technical_details, results='always'}
+cat("### KNN Model Selection\n\n")
+
+cat("Based on our comprehensive evaluation of five different KNN implementations, the **Extended value KNN** model with **k=17** emerged as the best performer with an accuracy of **0.8262**. This model also achieved a precision of 0.6700 and recall of 0.5755.\n\n")
+
+cat("The Extended value KNN model outperformed other implementations for several reasons:\n\n")
+
+cat("1. **Optimal k value**: The model found an optimal balance at k=17, avoiding both underfitting (too few neighbors) and overfitting (too many neighbors)\n")
+cat("2. **Higher accuracy**: At 0.8262, it achieved the highest overall accuracy among all models tested\n")
+cat("3. **Good precision-recall balance**: While the Weighted KNN (k=20) showed similar performance (0.8246 accuracy), the Extended value KNN maintained better overall metrics\n")
+cat("4. **Consistent performance**: As shown in the performance comparison graph, this implementation demonstrated stable results across different k values\n\n")
+
+cat("The second-best model was the Weighted KNN with k=20, which achieved an accuracy of 0.8246. All five implementations performed reasonably well with accuracies above 0.82, demonstrating the robustness of the KNN approach for this classification task.\n\n")
+
+cat("This optimal KNN model will be used for predicting customers with high income potential (>$50K annually), supporting the bank's targeted marketing strategies alongside our cluster analysis.\n")
+```
+
+```{r clustering_data_prep, eval=params$report_type == "technical", echo=TRUE, results='asis'}
+##' Clustering Data Preparation 
+# -------------------------
+##' Determine optimal number of clusters for different approaches
+# Prepare data for clustering (exclude income for unbiased clustering)
+set.seed(123)
+train_sample_cluster <- train_sample %>% select(-income)
+train_sample_with_income <- train_sample # Keep a copy with income for later analysis
+
+# Get only numeric features and handle missing values
+train_numeric <- train_sample_cluster %>% 
+  select_if(is.numeric) %>%
+  # Replace NA values with column means
+  mutate(across(everything(), ~ifelse(is.na(.), mean(., na.rm = TRUE), .)))
+
+# Check dimensions
+cat("Dimensions after handling missing values:\n")
+cat("train_numeric:", dim(train_numeric), "\n")
+cat("train_sample_with_income:", dim(train_sample_with_income), "\n")
+
+# For subset of features
+numeric_features <- c("age", "education_num", "capital_gain", "hours_per_week")
+train_subset <- train_sample_cluster[numeric_features] %>%
+  # Replace NA values with column means
+  mutate(across(everything(), ~ifelse(is.na(.), mean(., na.rm = TRUE), .)))
+```
+
+```{r clustering_all_features, eval=params$report_type == "technical", echo=TRUE, results='asis'}
+##' Determine Optimal Number of Clusters
+# -------------------------
+# Based on the elbow and silhouette plots, let's determine optimal K values
+
+# For all numeric features
+set.seed(123)
+silhouette_plot_all <- fviz_nbclust(train_numeric, kmeans, method = "silhouette", k.max = 15) +
+  ggtitle("Silhouette Method for All Numeric Features") +
+  xlab("Number of clusters (k)") +
+  ylab("Average Silhouette Width")
+print(silhouette_plot_all)
+```
+
+```{r cluster_num, eval=params$report_type == "technical", echo=TRUE, results='asis'}
+# Based on plot results (above)
+# The silhouette plot indicates K=5 gives the best cluster separation
+optimal_k_all <- 5 # Optimal K for all numeric features
+alternative_k_all <- 3  # Use K=3 as an alternative for comparison
+# 
+# Determine optimal K for this subset of features
+set.seed(123)
+silhouette_plot_subset <- fviz_nbclust(train_subset, kmeans, method = "silhouette", k.max = 15) +
+  ggtitle("Silhouette Method for Selected Features") +
+  xlab("Number of clusters (k)") +
+  ylab("Average Silhouette Width")
+print(silhouette_plot_subset)
+```
+
+
+```{r cluster_silh, eval=params$report_type == "technical", echo=TRUE, results='asis'}
+# Based on the silhouette plot for selected features (above)
+# The highest peak is at k=4
+optimal_k_subset <- 4 # Optimal K for selected features based on the silhouette plot
+# -------------------------
+
+##' Build 5 Clustering Models Based on Optimal K Analysis
+
+```
+
+```{r knn1, eval=params$report_type == "technical", echo=TRUE, results='asis'}
+##' MODEL 1: K-means with optimal K=5 on all numeric features ("optimal_k_all")
+# -------------------------
+set.seed(123)
+kmeans_model1 <- kmeans(train_numeric, centers = optimal_k_all)
+
+# Verify lengths match before creating contingency table
+cat("\nLengths check for Model 1:\n")
+cat("Cluster length:", length(kmeans_model1$cluster), "\n")
+cat("Income length:", length(train_sample_with_income$income), "\n")
+
+# Create contingency table
+model1_table <- table(Cluster = kmeans_model1$cluster, Income = train_sample_with_income$income)
+print(model1_table)
+
+# Calculate percentages for high income by cluster
+model1_percentages <- prop.table(model1_table, margin = 1) * 100
+print(model1_percentages)
+```
+
+```{r knn2, eval=params$report_type == "technical", echo=TRUE, results='asis'}
+##' MODEL 2: K-means with alternative K=3 on all numeric features
+# -------------------------
+set.seed(123)
+kmeans_model2 <- kmeans(train_numeric, centers = alternative_k_all)
+
+# Create contingency table
+model2_table <- table(Cluster = kmeans_model2$cluster, Income = train_sample_with_income$income)
+print(model2_table)
+
+# Calculate percentages
+model2_percentages <- prop.table(model2_table, margin = 1) * 100
+print(model2_percentages)
+```
+
+```{r knn3, eval=params$report_type == "technical", echo=TRUE, results='asis'}
+##' MODEL 3: K-means with optimal K=4 on selected features
+# -------------------------
+set.seed(123)
+kmeans_model3 <- kmeans(train_subset, centers = optimal_k_subset)
+
+# Create contingency table
+model3_table <- table(Cluster = kmeans_model3$cluster, Income = train_sample_with_income$income)
+print(model3_table)
+
+# Calculate percentages
+model3_percentages <- prop.table(model3_table, margin = 1) * 100
+print(model3_percentages)
+```
+
+```{r knn4, eval=params$report_type == "technical", echo=TRUE, results='asis'}
+##' MODEL 4: PAM (Partitioning Around Medoids) with K=5
+# -------------------------
+set.seed(123)
+pam_model <- pam(train_numeric, k = optimal_k_all, diss = FALSE)
+
+# Create contingency table
+model4_table <- table(Cluster = pam_model$clustering, Income = train_sample_with_income$income)
+print(model4_table)
+
+# Calculate percentages
+model4_percentages <- prop.table(model4_table, margin = 1) * 100
+print(model4_percentages)
+```
+
+```{r knn5, eval=params$report_type == "technical", echo=TRUE, results='asis'}
+##' MODEL 5: Hierarchical Clustering with K=5
+# -------------------------
+# Compute distance matrix
+dist_matrix <- dist(train_numeric, method = "euclidean")
+
+# Perform hierarchical clustering
+hclust_model <- hclust(dist_matrix, method = "ward.D2")
+
+# Cut the tree to get optimal number of clusters
+hclust_clusters <- cutree(hclust_model, k = optimal_k_all)
+
+# Create contingency table
+model5_table <- table(Cluster = hclust_clusters, Income = train_sample_with_income$income)
+print(model5_table)
+
+# Calculate percentages
+model5_percentages <- prop.table(model5_table, margin = 1) * 100
+print(model5_percentages)
+```
+
+```{r knn_all_compare, eval=params$report_type == "technical", echo=TRUE, results='asis'}
+##' Compare All Clustering Models
+# -------------------------
+# Create a function to calculate silhouette score
+calculate_silhouette <- function(data, cluster_assignments) {
+  sil <- silhouette(cluster_assignments, dist(data))
+  mean(sil[,3])  # Average silhouette width
+}
+
+# Calculate silhouette scores for each model
+silhouette_scores <- data.frame(
+  Model = c("K-means (K=5)", "K-means (K=3)", "K-means Selected Features (K=4)", 
+            "PAM (K=5)", "Hierarchical (K=5)"),
+  Silhouette_Score = c(
+    calculate_silhouette(train_numeric, kmeans_model1$cluster),
+    calculate_silhouette(train_numeric, kmeans_model2$cluster),
+    calculate_silhouette(train_subset, kmeans_model3$cluster),
+    calculate_silhouette(train_numeric, pam_model$clustering),
+    calculate_silhouette(train_numeric, hclust_clusters)
+  )
+)
+
+# Sort by silhouette score (higher is better)
+silhouette_scores <- silhouette_scores[order(-silhouette_scores$Silhouette_Score),]
+print(silhouette_scores)
+```
+
+```{r cluster_income_vize,eval=params$report_type == "technical", echo=TRUE, results='asis'}
+##' Visualize Income Distribution by Cluster for Each Model
+# -------------------------
+# Function to create income distribution visualizations
+plot_income_distribution <- function(clusters, income_data, model_name) {
+  cluster_data <- data.frame(
+    Cluster = as.factor(clusters),
+    Income = income_data
+  )
+  
+  ggplot(cluster_data, aes(x = Cluster, fill = Income)) +
+    geom_bar(position = "fill") +
+    scale_y_continuous(labels = scales::percent) +
+    labs(title = paste("Income Distribution by Cluster -", model_name),
+         x = "Cluster",
+         y = "Percentage",
+         fill = "Income") +
+    theme_minimal()
+}
+
+# Create visualization for each model
+plot1 <- plot_income_distribution(kmeans_model1$cluster, train_sample_with_income$income, "K-means (K=3)")
+plot2 <- plot_income_distribution(kmeans_model2$cluster, train_sample_with_income$income, "K-means (K=5)")
+plot3 <- plot_income_distribution(kmeans_model3$cluster, train_sample_with_income$income, "K-means Selected Features (K=3)")
+plot4 <- plot_income_distribution(pam_model$clustering, train_sample_with_income$income, "PAM (K=3)")
+plot5 <- plot_income_distribution(hclust_clusters, train_sample_with_income$income, "Hierarchical (K=3)")
+
+# Display all plots in a grid
+grid.arrange(plot1, plot2, plot3, plot4, plot5, ncol = 2)
+```
+
+```{r cluster_best_model, eval=params$report_type == "technical", echo=TRUE, results='asis'}
+##' Analyze Cluster Characteristics for the Best Model
+# -------------------------
+# Identify the best model based on silhouette score
+best_model_name <- silhouette_scores$Model[1]
+cat("The best clustering model based on silhouette score is:", best_model_name, "\n")
+
+# Extract cluster assignments from the best model based on which has the highest score
+if(best_model_name == "K-means (K=5)") {
+  best_clusters <- kmeans_model1$cluster
+  expected_clusters <- 5
+  model_percentages <- model1_percentages
+} else if(best_model_name == "K-means (K=3)") {
+  best_clusters <- kmeans_model2$cluster
+  expected_clusters <- 3
+  model_percentages <- model2_percentages
+} else if(best_model_name == "K-means Selected Features (K=4)") {
+  best_clusters <- kmeans_model3$cluster
+  expected_clusters <- 4
+  model_percentages <- model3_percentages
+} else if(best_model_name == "PAM (K=5)") {
+  best_clusters <- pam_model$clustering
+  expected_clusters <- 5
+  model_percentages <- model4_percentages
+} else if(best_model_name == "Hierarchical (K=5)") {
+  best_clusters <- hclust_clusters
+  expected_clusters <- 5
+  model_percentages <- model5_percentages
+}
+
+# Verify all clusters are present
+present_clusters <- sort(unique(best_clusters))
+cat("\nExpected", expected_clusters, "clusters. Found", length(present_clusters), "clusters:", paste(present_clusters, collapse=", "), "\n")
+
+# Check if any expected clusters are missing
+if(length(present_clusters) < expected_clusters) {
+  cat("WARNING: Some clusters are empty or missing. This can happen with certain data distributions.\n")
+}
+
+# Use the appropriate data for the best model
+if(best_model_name == "K-means Selected Features (K=4)") {
+  cluster_profile_data <- cbind(train_subset, Cluster = as.factor(best_clusters))
+} else {
+  cluster_profile_data <- cbind(train_numeric, Cluster = as.factor(best_clusters))
+}
+
+# Calculate mean values for each feature by cluster
+cluster_profiles <- aggregate(. ~ Cluster, data = cluster_profile_data, mean)
+print(cluster_profiles)
+
+# Create a comprehensive cluster summary table
+cluster_summary <- data.frame(
+  Cluster = as.numeric(levels(as.factor(best_clusters))),
+  Size = as.numeric(table(best_clusters)),
+  Size_Percent = round(100 * as.numeric(table(best_clusters)) / length(best_clusters), 1)
+)
+
+# Add income percentages for each cluster
+for(i in 1:nrow(cluster_summary)) {
+  cluster_id <- cluster_summary$Cluster[i]
+  if(as.character(cluster_id) %in% rownames(model_percentages)) {
+    cluster_summary$HighIncome_Pct[i] <- round(model_percentages[as.character(cluster_id), ">50K"], 1)
+  } else {
+    cluster_summary$HighIncome_Pct[i] <- NA
+  }
+}
+
+# Add descriptive labels based on feature profiles
+# Match cluster numbers to cluster_profiles rows
+cluster_summary$Education <- NA
+cluster_summary$Age <- NA
+cluster_summary$WorkHours <- NA
+cluster_summary$CapitalGains <- NA
+
+for(i in 1:nrow(cluster_summary)) {
+  cluster_id <- cluster_summary$Cluster[i]
+  # Find matching row in cluster_profiles
+  profile_row <- which(cluster_profiles$Cluster == cluster_id)
+  
+  if(length(profile_row) > 0) {
+    # Education level categorization
+    edu_value <- cluster_profiles[profile_row, "education_num"]
+    if(!is.na(edu_value)) {
+      if(edu_value > 0.7) cluster_summary$Education[i] <- "High"
+      else if(edu_value > 0.5) cluster_summary$Education[i] <- "Medium"
+      else cluster_summary$Education[i] <- "Low"
+    }
+    
+    # Age categorization
+    age_value <- cluster_profiles[profile_row, "age"]
+    if(!is.na(age_value)) {
+      if(age_value > 0.4) cluster_summary$Age[i] <- "Older"
+      else if(age_value > 0.25) cluster_summary$Age[i] <- "Middle-aged"
+      else cluster_summary$Age[i] <- "Younger"
+    }
+    
+    # Work hours categorization
+    hours_value <- cluster_profiles[profile_row, "hours_per_week"]
+    if(!is.na(hours_value)) {
+      if(hours_value > 0.45) cluster_summary$WorkHours[i] <- "Long"
+      else if(hours_value > 0.4) cluster_summary$WorkHours[i] <- "Average"
+      else cluster_summary$WorkHours[i] <- "Short"
+    }
+    
+    # Capital gains categorization
+    capital_value <- cluster_profiles[profile_row, "capital_gain"]
+    if(!is.na(capital_value)) {
+      if(capital_value > 0.02) cluster_summary$CapitalGains[i] <- "High"
+      else if(capital_value > 0.005) cluster_summary$CapitalGains[i] <- "Medium"
+      else cluster_summary$CapitalGains[i] <- "Low"
+    }
+  }
+}
+
+# Sort by high income percentage (descending)
+cluster_summary <- cluster_summary[order(-cluster_summary$HighIncome_Pct),]
+
+# Add customer segment labels based on characteristics
+cluster_summary$CustomerSegment <- paste0(
+  "Segment ", 1:nrow(cluster_summary), ": ",
+  cluster_summary$Age, " age, ",
+  cluster_summary$Education, " education, ",
+  cluster_summary$WorkHours, " hours"
+)
+# Print the comprehensive summary
+cat("\n### Customer Segment Analysis Based on Clustering\n\n")
+print(cluster_summary)
+
+# Identify the highest-value cluster
+highest_value_cluster <- cluster_summary$Cluster[1]  # Already sorted by HighIncome_Pct
+highest_value_pct <- cluster_summary$HighIncome_Pct[1]
+
+# Visualize feature profiles by cluster with better formatting
+cluster_profiles_long <- reshape2::melt(cluster_profiles, id.vars = "Cluster")
+
+# Create a more readable plot
+ggplot(cluster_profiles_long, aes(x = variable, y = value, fill = Cluster)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = paste("Feature Profiles for", best_model_name),
+       subtitle = paste("Comparing average feature values across", length(unique(best_clusters)), "customer segments"),
+       x = "Feature",
+       y = "Normalized Value (0-1 scale)",
+       fill = "Cluster") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, size = 12),
+    legend.position = "top"
+  ) +
+  scale_fill_brewer(palette = "Set1")
+```
+
+
+
+```{r cluster_report_mgmt, eval=params$report_type == "management", echo=FALSE, results='asis'}
+# Generate business insights
+cat("\n## Business Insights and Recommendations\n\n")
+
+cat("### Key Customer Segments:\n")
+for(i in 1:min(3, nrow(cluster_summary))) {
+  cat(paste0("**", cluster_summary$CustomerSegment[i], "**\n"))
+  cat(paste0("- Size: ", cluster_summary$Size[i], " customers (", cluster_summary$Size_Percent[i], "% of total)\n"))
+  cat(paste0("- High Income: ", cluster_summary$HighIncome_Pct[i], "% earn >$50K annually\n"))
+  
+  # Add product recommendations based on segment characteristics
+  cat("- Recommended Products: ")
+  if(cluster_summary$Education[i] == "High" && cluster_summary$HighIncome_Pct[i] > 40) {
+    cat("Investment portfolios, Premium credit cards, Wealth management services\n")
+  } else if(cluster_summary$Education[i] == "Medium" && cluster_summary$Age[i] == "Middle-aged") {
+    cat("Retirement planning, College savings plans, Home equity products\n")
+  } else if(cluster_summary$Age[i] == "Younger") {
+    cat("First-time homebuyer programs, Student loan refinancing, Digital banking services\n")
+  } else {
+    cat("Basic savings accounts, Secured credit cards, Budget management tools\n")
+  }
+  cat("\n")
+}
+
+cat("\n### Priority Recommendations:\n")
+cat(paste0("1. **Focus on Segment 1 (", highest_value_pct, "% high-income)**: This segment represents the highest-value customers and should be prioritized for premium banking services and personalized wealth management.\n\n"))
+cat("2. **Targeted Marketing Strategies**: Develop segment-specific marketing campaigns based on the demographic and financial profiles identified in the clustering analysis.\n\n")
+cat("3. **Product Development**: Design new banking products that address the specific needs of each customer segment, with particular attention to the preferences of high-income segments.\n\n")
+cat("4. **Customer Retention**: Implement tailored retention strategies for high-value segments to minimize churn and maximize customer lifetime value.\n\n")
+```
+
+
+```{r conclusion, eval=params$report_type == "management", echo=FALSE, results='asis'}
+##' Conclusion and Final Model Selection
+# -------------------------
+# Create a summary table of all models with key metrics
+model_summary <- data.frame(
+  Model = silhouette_scores$Model,
+  Silhouette_Score = round(silhouette_scores$Silhouette_Score, 3)
+)
+
+# Display the final summary table
+kable(model_summary, caption = "Clustering Model Comparison") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+
+# Verify that we have valid silhouette scores before attempting to access them
+if(nrow(silhouette_scores) > 0 && !is.na(silhouette_scores$Silhouette_Score[1])) {
+  # Provide a conclusion about the best model and its characteristics
+  cat("\n### Final Model Selection\n\n")
+  cat("Based on the silhouette scores and income distribution analysis, the best clustering model is **", 
+      best_model_name, "** with a silhouette score of **", 
+      round(silhouette_scores$Silhouette_Score[1], 3), "**.\n\n")
+  
+  # Add details about what this tells us about the data
+  cat("This suggests that the data naturally forms into", best_model_name, "groups with distinct characteristics.\n\n")
+  
+  # Add a note about what these clusters mean for the bank
+  cat("### Business Value of Clustering\n\n")
+  
+  cat("The clustering analysis reveals distinct customer segments with varying income levels and demographic profiles. ")
+  cat("By understanding these natural groupings, the bank can:\n\n")
+  
+  cat("1. **Develop targeted marketing campaigns** for each customer segment\n")
+  cat("2. **Create specialized banking products** that address the specific needs of each group\n")
+  cat("3. **Allocate resources efficiently** by focusing on high-potential customer segments\n")
+  cat("4. **Improve customer satisfaction** through more personalized services\n\n")
+  
+  # Add a transition to the KNN analysis connection
+  cat("When combined with our KNN classification models, these clusters provide complementary insights: ")
+  cat("while KNN predicts which individual customers are likely to have high income, ")
+  cat("clustering reveals natural customer segments regardless of income level, allowing for more nuanced marketing strategies.\n")
+} else {
+  cat("Unable to determine the best model due to missing or invalid silhouette scores.\n")
+}
+```

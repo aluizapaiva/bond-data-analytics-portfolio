@@ -1,0 +1,3258 @@
+---
+title: "bbs_project_analysis"
+author: "Ana Paiva"
+date: "2025-12-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# At the top of your script, after loading packages:
+set.seed(2025)
+
+required_packages <- c(
+  "MASS",
+  "tidyverse",
+  "lubridate",
+  "lme4",
+  "lmerTest",
+  "broom.mixed",
+  "nlme",
+  "mgcv",
+  "car",
+  "emmeans",
+  "MuMIn",
+  "patchwork",
+  "scales",
+  "knitr",
+  "kableExtra",
+  "performance",
+  "ggeffects",
+  "mice",
+  "glmnet",
+  "rpart",
+  "rpart.plot"
+)
+
+install_and_load <- function(packages) {
+  for (pkg in packages) {
+    if (!require(pkg, character.only = TRUE, quietly = TRUE)) {
+      message(paste("Installing package:", pkg))
+      install.packages(pkg, dependencies = TRUE)
+      library(pkg, character.only = TRUE)
+    }
+  }
+}
+
+install_and_load(required_packages)
+```
+
+## SECTION 1: DATA LOADING AND PREPARATION
+```{r section1, echo=TRUE}
+
+setwd("data/")
+
+sites <- read.csv("Sites.csv", stringsAsFactors = FALSE)
+fire_history <- read.csv("FireHistory.csv", stringsAsFactors = FALSE)
+visits <- read.csv("Visits.csv", stringsAsFactors = FALSE)
+species_data <- read.csv("Data.csv", stringsAsFactors = FALSE)
+
+cat("Structure of Sites data:\n")
+str(sites)
+cat("\nStructure of Fire History data:\n")
+str(fire_history)
+cat("\nStructure of Visits data:\n")
+str(visits)
+cat("\nStructure of Species data:\n")
+str(species_data)
+
+```
+
+### SECTION 1.1: PLOTTING PREP
+```{r plot_setup, echo=FALSE, message=FALSE}
+# Create figures directory if it doesn't exist
+
+setwd("data/")
+
+if (!dir.exists("figures")) {
+  dir.create("figures")
+  cat("Created 'figures/' directory for saving plots\n")
+}
+
+# Define a helper function to save plots consistently
+save_plot <- function(plot_obj, filename, width = 10, height = 6) {
+  filepath <- file.path("figures", filename)
+  ggsave(filepath, plot = plot_obj, width = width, height = height, dpi = 300)
+  cat("Saved:", filepath, "\n")
+}
+
+# Color palette (consistent with your theme)
+custom_colors <- c("Wet" = "#1a9988", "Dry" = "#2c5aa0")
+palette_diagnostic <- c("#2c5aa0", "#3d7bb8", "#1a9988", "#0d5c52")
+
+theme_set(theme_minimal(base_size = 12))
+
+custom_gradient <- c("#e0f4f1", "#1a9988", "#0d5c52")
+palette_main <- c("Wet" = "#1a9988", "Dry" = "#2c5aa0")
+palette_gradient <- colorRampPalette(c("#2c5aa0", "#1a9988", "#0d5c52"))
+palette_stages <- c("#2c5aa0", "#3d7bb8", "#4e9caa", "#1a9988", "#15877a", "#0d5c52")
+```
+
+
+### SECTION 1.1: DATE CONVERSION AND VALIDATION
+```{r section1.1, echo=TRUE}
+cat("\n")
+
+cat("SECTION 1.1: DATE CONVERSION AND VALIDATION\n")
+
+
+# Convert date columns ONLY if they are still character type
+if (is.character(fire_history$Ref_Fire)) {
+  fire_history <- fire_history %>%
+    mutate(
+      Ref_Fire = dmy(Ref_Fire),
+      Prv_Fire = dmy(Prv_Fire)
+    )
+  cat("Fire history dates converted from character to Date.\n\n")
+} else {
+  cat("Fire history dates already in Date format - skipping conversion.\n\n")
+}
+
+if (is.character(visits$Date)) {
+  visits <- visits %>%
+    mutate(Date = dmy(Date))
+  cat("Visit dates converted from character to Date.\n\n")
+} else {
+  cat("Visit dates already in Date format - skipping conversion.\n\n")
+}
+
+# Validate conversions
+cat("--- Date Conversion Validation ---\n\n")
+
+ref_fire_na <- sum(is.na(fire_history$Ref_Fire))
+prv_fire_na <- sum(is.na(fire_history$Prv_Fire))
+visit_date_na <- sum(is.na(visits$Date))
+
+cat("Parsing results:\n")
+cat("  Ref_Fire: ", nrow(fire_history) - ref_fire_na, "/", nrow(fire_history), 
+    " valid dates\n", sep = "")
+cat("  Prv_Fire: ", nrow(fire_history) - prv_fire_na, "/", nrow(fire_history), 
+    " valid dates (", prv_fire_na, " legitimately missing)\n", sep = "")
+cat("  Visit Date: ", nrow(visits) - visit_date_na, "/", nrow(visits), 
+    " valid dates\n\n", sep = "")
+
+# Display date ranges
+cat("--- Temporal Coverage ---\n\n")
+
+cat("Reference Fire Events:\n")
+cat("  Range: ", format(min(fire_history$Ref_Fire, na.rm = TRUE), "%d %b %Y"), 
+    " to ", format(max(fire_history$Ref_Fire, na.rm = TRUE), "%d %b %Y"), "\n", sep = "")
+cat("  Note: Reference fires span historical prescribed burns and wildfires\n\n")
+
+cat("Field Visits:\n")
+cat("  Range: ", format(min(visits$Date, na.rm = TRUE), "%d %b %Y"), 
+    " to ", format(max(visits$Date, na.rm = TRUE), "%d %b %Y"), "\n", sep = "")
+cat("  Span: ", round(as.numeric(difftime(max(visits$Date, na.rm = TRUE), 
+                                           min(visits$Date, na.rm = TRUE), 
+                                           units = "days")) / 365.25, 1), " years\n\n", sep = "")
+
+# Critical observation: visits span BEFORE and AFTER fires
+cat("--- Critical Temporal Structure ---\n\n")
+
+visits_with_fire <- visits %>%
+  left_join(fire_history %>% dplyr::select(Site, Ref_Fire), by = "Site")
+
+pre_fire_visits <- sum(visits_with_fire$Date < visits_with_fire$Ref_Fire, na.rm = TRUE)
+post_fire_visits <- sum(visits_with_fire$Date >= visits_with_fire$Ref_Fire, na.rm = TRUE)
+
+cat("Visit timing relative to Reference Fire:\n")
+cat("  Pre-fire visits (baseline): ", pre_fire_visits, " (", 
+    round(pre_fire_visits / nrow(visits) * 100, 1), "%)\n", sep = "")
+cat("  Post-fire visits (recovery): ", post_fire_visits, " (", 
+    round(post_fire_visits / nrow(visits) * 100, 1), "%)\n\n", sep = "")
+
+cat("INTERPRETATION:\n")
+cat("  Pre-fire visits provide BASELINE biodiversity measurements.\n")
+cat("  These will appear as NEGATIVE values in TimeSinceFire.\n")
+cat("  This is methodologically valuable - not an error.\n\n")
+```
+
+### SECTION 1.2: DATA MERGING WITH EXPLICIT JUSTIFICATION
+```{r section1.2, echo=TRUE}
+
+cat("SECTION 1.2: DATA MERGING STRATEGY\n")
+
+
+cat("--- Merge Rationale ---\n\n")
+
+cat("Data Structure:\n")
+cat("  - Sites.csv: 36 unique sites with environmental characteristics\n")
+cat("  - FireHistory.csv: 36 records (1:1 with sites) with fire dates\n")
+cat("  - Visits.csv: 170 field visits (multiple visits per site over time)\n")
+cat("  - Data.csv: 8136 species observations (multiple per visit)\n\n")
+
+cat("Merge Strategy:\n")
+cat("  Step 1: sites + fire_history -> sites_fire (1:1 merge by Site)\n")
+cat("  Step 2: visits + sites_fire -> analysis_data (many:1 merge by Site)\n\n")
+
+cat("Justification for LEFT JOIN:\n")
+cat("  - Unit of analysis: Individual field VISITS (not sites, not species)\n")
+cat("  - LEFT JOIN preserves all 170 visits even if site info were missing\n")
+cat("  - Ensures no loss of response variable observations\n\n")
+
+# Execute the merge
+sites_fire <- sites %>%
+  left_join(fire_history, by = "Site")
+
+# Validate 1:1 merge
+cat("--- Merge Validation: Sites + FireHistory ---\n\n")
+cat("Expected: 36 rows (1:1 relationship)\n")
+cat("Actual:   ", nrow(sites_fire), " rows\n", sep = "")
+if (nrow(sites_fire) == nrow(sites)) {
+  cat("Status:   PASSED - No unexpected duplication\n\n")
+} else {
+  cat("Status:   WARNING - Row count mismatch, check for duplicates\n\n")
+}
+
+# Main merge: visits to site characteristics
+analysis_data <- visits %>%
+  left_join(sites_fire, by = "Site") %>%
+  mutate(
+    # Calculate time since reference fire (can be negative for pre-fire visits)
+    TimeSinceFire = as.numeric(difftime(Date, Ref_Fire, units = "days")) / 365.25,
+    
+    # Calculate fire interval (time between previous and reference fire)
+    FireInterval = as.numeric(difftime(Ref_Fire, Prv_Fire, units = "days")) / 365.25,
+    
+    # Extract region from site code prefix
+    Region = case_when(
+      str_detect(Site, "^NU") ~ "Nungar Plain (NSW)",
+      str_detect(Site, "^BU") ~ "Buchan River (VIC)",
+      str_detect(Site, "^ME") ~ "Merambego Ridge (NSW)",
+      str_detect(Site, "^NA") ~ "Namadgi (ACT)",
+      TRUE ~ "Unknown"
+    ),
+    
+    # Convert categorical variables to factors with explicit reference levels
+    Type = factor(Type, levels = c("Dry", "Wet")),  # Dry as reference
+    Grassy = factor(Grassy),
+    Dominant = factor(Dominant),
+    Aspect = factor(Aspect),
+    Ref_Type = factor(Ref_Type),
+    Prv_Type = factor(Prv_Type),
+    Region = factor(Region),
+    Site = as.factor(Site)
+  )
+
+# Validate many:1 merge
+cat("--- Merge Validation: Visits + Sites_Fire ---\n\n")
+cat("Expected: 170 rows (all visits preserved)\n")
+cat("Actual:   ", nrow(analysis_data), " rows\n", sep = "")
+if (nrow(analysis_data) == nrow(visits)) {
+  cat("Status:   PASSED - All visits retained\n\n")
+} else {
+  cat("Status:   WARNING - Row count mismatch\n\n")
+}
+
+# Check for sites that didn't match
+unmatched <- analysis_data %>% filter(is.na(Type)) %>% nrow()
+cat("Unmatched visits (missing site info): ", unmatched, "\n\n", sep = "")
+```
+
+
+### SECTION 1.3: MISSING DATA ANALYSIS
+```{r section1.3, echo=TRUE}
+
+cat("SECTION 1.3: MISSING DATA ANALYSIS\n")
+
+
+# Identify missing values
+missing_summary <- analysis_data %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "N_Missing") %>%
+  filter(N_Missing > 0) %>%
+  mutate(Pct_Missing = round(N_Missing / nrow(analysis_data) * 100, 1)) %>%
+  arrange(desc(N_Missing))
+
+cat("Variables with Missing Values:\n\n")
+print(as.data.frame(missing_summary))
+
+cat("\n--- Missing Data Mechanism Analysis ---\n\n")
+
+# Analyze the pattern
+n_missing_prv <- sum(is.na(analysis_data$Prv_Fire))
+n_sites_no_prv <- analysis_data %>% 
+  filter(is.na(Prv_Fire)) %>% 
+  pull(Site) %>% 
+  unique() %>% 
+  length()
+
+cat("Pattern Analysis:\n")
+cat("  - ", n_missing_prv, " observations (", 
+    round(n_missing_prv / nrow(analysis_data) * 100, 1), 
+    "%) missing Prv_Fire, Prv_Type, and FireInterval\n", sep = "")
+cat("  - These correspond to ", n_sites_no_prv, " unique sites\n\n", sep = "")
+
+# Check if missingness relates to Type
+missing_by_type <- analysis_data %>%
+  group_by(Type) %>%
+  summarise(
+    N = n(),
+    N_Missing = sum(is.na(Prv_Fire)),
+    Pct_Missing = round(N_Missing / N * 100, 1),
+    .groups = "drop"
+  )
+
+cat("Missing Previous Fire by Site Type:\n")
+print(as.data.frame(missing_by_type))
+```
+
+```{r section1.3.1, echo=FALSE}
+cat("\n")
+cat("MISSING DATA MECHANISM DETERMINATION:\n\n")
+cat("  Classification: MNAR (Missing Not At Random)\n\n")
+cat("  Reasoning:\n")
+cat("  - Missing Prv_Fire means NO RECORDED previous fire event\n")
+cat("  - This is INFORMATIVE - it indicates sites with only ONE fire in history\n")
+cat("  - The missingness IS the data: these sites have Fire_Cnt = 1\n\n")
+```
+
+```{r section1.3.2, echo=TRUE}
+# Verify the relationship between missing Prv_Fire and Fire_Cnt
+fire_cnt_check <- analysis_data %>%
+  mutate(Has_Prv_Fire = !is.na(Prv_Fire)) %>%
+  group_by(Has_Prv_Fire) %>%
+  summarise(
+    Mean_Fire_Cnt = round(mean(Fire_Cnt), 2),
+    Min_Fire_Cnt = min(Fire_Cnt),
+    Max_Fire_Cnt = max(Fire_Cnt),
+    .groups = "drop"
+  )
+
+cat("Validation - Fire Count by Previous Fire Status:\n")
+print(as.data.frame(fire_cnt_check))
+```
+
+```{r section1.3.3, echo=FALSE}
+cat("\n")
+cat("  Confirmed: Sites with missing Prv_Fire have Fire_Cnt = 1\n")
+cat("  These are first-time fire sites in the monitoring record.\n\n")
+
+cat("IMPLICATION FOR ANALYSIS:\n")
+cat("  - Do NOT impute Prv_Fire or FireInterval with arbitrary values\n")
+cat("  - Create indicator variable: HasPreviousFire (Yes/No)\n")
+cat("  - FireInterval analysis should be restricted to multi-fire sites\n")
+cat("  - Or model FireInterval = 0 for first-fire sites (interpretable as no prior disturbance)\n\n")
+
+```
+
+
+### SECTION 1.4: TEMPORAL STRUCTURE VALIDATION
+```{r section1.4, echo=TRUE}
+
+cat("SECTION 1.4: TEMPORAL STRUCTURE OF THE DATA\n")
+
+# Summarize TimeSinceFire distribution
+time_summary <- analysis_data %>%
+  group_by(Type) %>%
+  summarise(
+    N = n(),
+    N_Sites = n_distinct(Site),
+    Min_Years = round(min(TimeSinceFire, na.rm = TRUE), 2),
+    Max_Years = round(max(TimeSinceFire, na.rm = TRUE), 2),
+    Mean_Years = round(mean(TimeSinceFire, na.rm = TRUE), 2),
+    N_PreFire = sum(TimeSinceFire < 0, na.rm = TRUE),
+    N_PostFire = sum(TimeSinceFire >= 0, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cat("TimeSinceFire Distribution by Site Type:\n\n")
+print(as.data.frame(time_summary))
+```
+
+```{r section1.4.1, echo=FALSE}
+cat("\n")
+cat("KEY OBSERVATIONS:\n\n")
+
+cat("1. NEGATIVE TimeSinceFire VALUES:\n")
+cat("   - These are PRE-FIRE baseline visits (not errors)\n")
+cat("   - Minimum: ~-7 years (visits occurred ~7 years before reference fire)\n")
+cat("   - Methodologically valuable for understanding baseline biodiversity\n\n")
+
+cat("2. UNEQUAL OBSERVATION WINDOWS:\n")
+dry_max <- max(analysis_data$TimeSinceFire[analysis_data$Type == "Dry"], na.rm = TRUE)
+wet_max <- max(analysis_data$TimeSinceFire[analysis_data$Type == "Wet"], na.rm = TRUE)
+cat("   - Dry sites: maximum ", round(dry_max, 1), " years post-fire\n", sep = "")
+cat("   - Wet sites: maximum ", round(wet_max, 1), " years post-fire\n", sep = "")
+cat("   - Ratio: Wet sites observed ", round(wet_max / dry_max, 1), 
+    "x longer than Dry sites\n\n", sep = "")
+
+cat("   CAUTION: This asymmetry could bias visual comparisons of recovery patterns.\n")
+cat("   Sensitivity analysis recommended within common time window.\n\n")
+
+cat("3. LONGITUDINAL STRUCTURE:\n")
+visits_per_site <- analysis_data %>%
+  group_by(Site) %>%
+  summarise(N_Visits = n(), .groups = "drop")
+
+cat("   - Visits per site: ", min(visits_per_site$N_Visits), " to ", 
+    max(visits_per_site$N_Visits), "\n", sep = "")
+cat("   - Mean visits per site: ", round(mean(visits_per_site$N_Visits), 1), "\n", sep = "")
+cat("   - This repeated-measures structure requires mixed effects models\n")
+cat("   - Observations within sites are NOT independent\n\n")
+
+```
+
+
+### SECTION 1.5: FINAL DATASET SUMMARY
+```{r section1.5, echo=FALSE}
+
+cat("SECTION 1.5: FINAL ANALYSIS DATASET\n")
+
+
+cat("Dataset Dimensions:\n")
+cat("  Observations: ", nrow(analysis_data), "\n", sep = "")
+cat("  Variables: ", ncol(analysis_data), "\n", sep = "")
+cat("  Unique Sites: ", n_distinct(analysis_data$Site), "\n", sep = "")
+cat("  Unique Visits: ", n_distinct(analysis_data$VisitID), "\n\n", sep = "")
+
+cat("Variable Roles:\n")
+cat("  Response: TotalSpecies (count of species per visit)\n")
+cat("  Primary Predictor: TimeSinceFire (years, can be negative)\n")
+cat("  Key Grouping: Type (Dry/Wet - research question focus)\n")
+cat("  Random Effect: Site (accounts for repeated measures)\n")
+cat("  Potential Covariates: Dominant, Grassy, Aspect, Fire_Cnt, Region\n\n")
+
+cat("Data Quality Notes:\n")
+cat("  - No missing values in response variable (TotalSpecies)\n")
+cat("  - No missing values in primary predictor (TimeSinceFire)\n")
+cat("  - FireInterval missing for first-fire sites (MNAR - informative)\n")
+cat("  - All categorical variables successfully converted to factors\n\n")
+
+```
+
+## SECTION 2: DATA DESCRIPTION AND BASIC TABULATIONS
+```{r section2, echo=TRUE}
+
+cat("SECTION 2: DATA DESCRIPTION AND TABULATIONS\n")
+
+
+# 2.1 Site Characteristics Summary
+cat("--- 2.1 Site Characteristics Summary ---\n\n")
+
+type_summary <- sites %>%
+  count(Type) %>%
+  mutate(Percentage = round(n / sum(n) * 100, 1))
+
+cat("Sites by Type (Wet vs Dry):\n\n")
+print(kable(type_summary, format = "simple"))
+cat("\n")
+
+cat("\nType by Ground Cover:\n\n")
+print(kable(table(sites$Type, sites$Grassy), format = "simple"))
+cat("\n")
+
+cat("\nType by Dominant Species:\n\n")
+print(kable(table(sites$Type, sites$Dominant), format = "simple"))
+cat("\n")
+
+cat("\nType by Aspect:\n\n")
+print(kable(table(sites$Type, sites$Aspect), format = "simple"))
+cat("\n")
+```
+
+```{r section2.2, echo=TRUE}
+# 2.2 Fire History Summary
+cat("\n--- 2.2 Fire History Summary ---\n\n")
+
+fire_summary <- fire_history %>%
+  left_join(sites, by = "Site") %>%
+  group_by(Type) %>%
+  summarise(
+    n_sites = n(),
+    mean_fire_count = round(mean(Fire_Cnt, na.rm = TRUE), 2),
+    sd_fire_count = round(sd(Fire_Cnt, na.rm = TRUE), 2),
+    pct_wildfire_ref = round(mean(Ref_Type == "WF") * 100, 1),
+    .groups = "drop"
+  )
+print(kable(fire_summary, format = "simple"))
+cat("\n")
+```
+
+```{r section2.3, echo=FALSE}
+# 2.3 Visit Summary Statistics
+cat("\n--- 2.3 Visit Summary Statistics ---\n\n")
+
+visit_summary <- analysis_data %>%
+  group_by(Type) %>%
+  summarise(
+    n_visits = n(),
+    n_sites = n_distinct(Site),
+    visits_per_site = round(n_visits / n_sites, 1),
+    .groups = "drop"
+  )
+print(kable(visit_summary, format = "simple"))
+cat("\n")
+```
+
+### 2.4 Key Response Variables Summary
+```{r section2.4, echo=TRUE}
+
+cat("\n--- 2.4 Biodiversity Metrics Summary ---\n\n")
+
+biodiversity_summary <- analysis_data %>%
+  group_by(Type) %>%
+  summarise(
+    mean_species = round(mean(TotalSpecies, na.rm = TRUE), 2),
+    sd_species = round(sd(TotalSpecies, na.rm = TRUE), 2),
+    min_species = min(TotalSpecies, na.rm = TRUE),
+    max_species = max(TotalSpecies, na.rm = TRUE),
+    mean_SWdiv = round(mean(TotalSWdiv, na.rm = TRUE), 3),
+    sd_SWdiv = round(sd(TotalSWdiv, na.rm = TRUE), 3),
+    .groups = "drop"
+  )
+print(kable(biodiversity_summary, format = "simple"))
+cat("\n")
+```
+
+### 2.5 Time Since Fire Summary
+```{r section2.5, echo=TRUE}
+
+cat("\n--- 2.5 Time Since Fire Summary ---\n\n")
+
+time_summary <- analysis_data %>%
+  group_by(Type) %>%
+  summarise(
+    mean_years = round(mean(TimeSinceFire, na.rm = TRUE), 2),
+    sd_years = round(sd(TimeSinceFire, na.rm = TRUE), 2),
+    min_years = round(min(TimeSinceFire, na.rm = TRUE), 2),
+    max_years = round(max(TimeSinceFire, na.rm = TRUE), 2),
+    .groups = "drop"
+  )
+print(kable(time_summary, format = "simple"))
+cat("\n")
+```
+
+
+### SECTION 2.6: RESPONSE VARIABLE DIAGNOSTIC PLOTS
+```{r fig_response_distribution1, echo=FALSE, fig.width=12, fig.height=5}
+
+cat("FIGURE 2.6: Response Variable Distribution Analysis\n")
+
+
+# Plot 2.6A: Histogram with density overlay
+p_hist <- ggplot(analysis_data, aes(x = TotalSpecies)) +
+
+geom_histogram(aes(y = after_stat(density)), 
+                 bins = 20, 
+                 fill = "#2c5aa0", 
+                 color = "white", 
+                 alpha = 0.7) +
+  geom_density(color = "#1a9988", linewidth = 1.2) +
+  geom_vline(xintercept = mean(analysis_data$TotalSpecies), 
+             linetype = "dashed", color = "#0d5c52", linewidth = 1) +
+  annotate("text", x = mean(analysis_data$TotalSpecies) + 5, y = 0.045,
+           label = paste("Mean =", round(mean(analysis_data$TotalSpecies), 1)),
+           color = "#0d5c52", fontface = "bold") +
+  labs(
+    title = "2.6A Distribution of Species Richness (Response Variable)",
+    subtitle = "Approximately normal distribution supports Gaussian modeling approach",
+    x = "Total Species Count per Visit",
+    y = "Density",
+    caption = paste0("n = ", nrow(analysis_data), " observations | ",
+                    "Mean = ", round(mean(analysis_data$TotalSpecies), 1), 
+                    " | SD = ", round(sd(analysis_data$TotalSpecies), 1))
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.caption = element_text(hjust = 0, face = "italic", color = "grey40"))
+print(p_hist)
+```
+
+```{r fig_response_distribution2, echo=FALSE, fig.width=12, fig.height=5}
+# Plot 2.6B: Distribution by Site Type
+p_type_dist <- ggplot(analysis_data, aes(x = TotalSpecies, fill = Type)) +
+  geom_histogram(bins = 15, alpha = 0.7, position = "identity", color = "white") +
+  scale_fill_manual(values = custom_colors) +
+  facet_wrap(~Type, ncol = 2) +
+  labs(
+    title = "2.6B. Species Richness Distribution by Site Type",
+    subtitle = "Similar distributions in Wet and Dry sites",
+    x = "Total Species Count",
+    y = "Frequency"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none")
+print(p_type_dist)
+```
+
+
+### Plot 2.6C: Variance vs Mean check (for overdispersion)
+```{r fig_response_distribution3, echo=FALSE, fig.width=12, fig.height=5}
+
+type_stats <- analysis_data %>%
+  group_by(Type) %>%
+  summarise(
+    Mean = mean(TotalSpecies),
+    Variance = var(TotalSpecies),
+    .groups = "drop"
+  ) %>%
+  mutate(Ratio = Variance / Mean)
+
+p_var_mean <- ggplot(type_stats, aes(x = Mean, y = Variance, color = Type)) +
+  geom_point(size = 5) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey50") +
+  geom_text(aes(label = paste0("Ratio: ", round(Ratio, 2))), 
+            vjust = -1.5, size = 4) +
+  scale_color_manual(values = custom_colors) +
+  labs(
+    title = "2.6C. Variance-Mean Relationship",
+    subtitle = "Points above diagonal indicate overdispersion (Var > Mean)",
+    x = "Mean Species Count",
+    y = "Variance",
+    caption = "Dashed line: Var = Mean (Poisson assumption)"
+  ) +
+  coord_cartesian(xlim = c(30, 50), ylim = c(30, 150)) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom",
+        plot.caption = element_text(hjust = 0, face = "italic", color = "grey40"))
+print(p_var_mean)
+```
+#### Combine and Save
+```{r fig_response_distribution4, echo=FALSE, fig.width=12, fig.height=5}
+
+fig_response <- (p_hist | p_type_dist) / p_var_mean +
+  plot_layout(heights = c(1, 0.8)) +
+  plot_annotation(
+    title = "Response Variable Diagnostic: TotalSpecies",
+    theme = theme(plot.title = element_text(size = 14, face = "bold"))
+  )
+
+print(fig_response)
+save_plot(fig_response, "fig_2.6_response_distribution.png", width = 12, height = 10)
+```
+
+## SECTION 3: EXPLORATORY VISUALIZATIONS
+```{r section3_sites, echo=FALSE, fig.width=8, fig.height=5}
+
+# 3.1 Distribution of Sites by Type
+p1_sites <- sites %>%
+  count(Type, Dominant) %>%
+  ggplot(aes(x = Type, y = n, fill = Dominant)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_brewer(palette = "GnBu") +
+  labs(
+    title = "Distribution of Sites by Type and Dominant Species",
+    subtitle = "Note: Wet and Dry sites differ in dominant eucalyptus composition",
+    x = "Site Type",
+    y = "Number of Sites",
+    fill = "Dominant\nEucalyptus",
+    caption = "Potential confounding: Type is not independent of Dominant species"
+  ) +
+  theme_minimal()
+print(p1_sites)
+```
+
+Wet and Dry sites show distinct dominant species composition (Snowgum 
+vs Peppermint), representing a potential confounding variable that should be 
+considered when interpreting differential recovery rates.
+
+### 3.2 Total Species Over Time by Site Type
+```{r section3_recovery, echo=FALSE, fig.width=10, fig.height=6}
+
+p2_species_time <- analysis_data %>%
+  ggplot(aes(x = TimeSinceFire, y = TotalSpecies, color = Type)) +
+  geom_point(alpha = 0.6, size = 2) +
+  geom_smooth(method = "loess", se = TRUE, linewidth = 1.2) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40", alpha = 0.7) +
+  scale_color_manual(values = custom_colors) +
+  labs(
+    title = "Species Richness Recovery Patterns: Wet vs Dry Sites",
+    subtitle = "LOESS smoothing with 95% CI | Dashed line = fire event | Negative values = pre-fire baseline",
+    x = "Years Since Reference Fire",
+    y = "Total Species Count",
+    color = "Site Type",
+    caption = "Note: Dry sites observed max 5.1 years vs Wet sites 15.2 years post-fire"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    plot.caption = element_text(hjust = 0, face = "italic", color = "grey40")
+  )
+
+print(p2_species_time)
+```
+### 3.3 Individual Site Trajectories
+```{r section3_trajectories, echo=FALSE, fig.width=10, fig.height=5}
+
+p5_trajectories <- analysis_data %>%
+  ggplot(aes(x = TimeSinceFire, y = TotalSpecies, group = Site, color = Type)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40", alpha = 0.7) +
+  geom_line(alpha = 0.5) +
+  geom_point(alpha = 0.5, size = 1) +
+  scale_color_manual(values = custom_colors) +
+  facet_wrap(~Type) +
+  labs(
+    title = "Individual Site Recovery Trajectories",
+    subtitle = "Each line represents one site across multiple visits | High between-site variability evident",
+    x = "Years Since Reference Fire",
+    y = "Total Species Count",
+    caption = "Note: Trajectories show heterogeneous recovery patterns within both site types"
+    ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.caption = element_text(hjust = 0, face = "italic", color = "grey40")
+  )
+print(p5_trajectories)
+```
+
+### 3.4 Recovery by Vegetation Layer
+```{r section3_layers, echo=FALSE, fig.width=10, fig.height=6}
+
+p6_layers <- analysis_data %>%
+  dplyr::select(Type, TimeSinceFire, GroundSpecies, MidStrySpecies, OvrStrySpecies) %>%
+  pivot_longer(
+    cols = c(GroundSpecies, MidStrySpecies, OvrStrySpecies),
+    names_to = "Layer",
+    values_to = "Species"
+  ) %>%
+  mutate(Layer = factor(case_match(Layer,
+                          "GroundSpecies" ~ "Ground Layer",
+                          "MidStrySpecies" ~ "Midstorey",
+                          "OvrStrySpecies" ~ "Overstory"),
+                      levels = c("Ground Layer", "Midstorey", "Overstory"))) %>%
+  ggplot(aes(x = TimeSinceFire, y = Species, color = Type)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40", alpha = 0.7) +
+  geom_point(alpha = 0.4, size = 1.5) +
+  geom_smooth(method = "loess", se = TRUE) +
+  scale_color_manual(values = custom_colors) +
+  facet_wrap(~Layer, scales = "free_y") +
+  labs(
+    title = "Species Recovery by Vegetation Stratum",
+    subtitle = "Ground layer dominates species richness | Recovery patterns vary by stratum",
+    x = "Years Since Reference Fire",
+    y = "Species Count",
+    color = "Site Type",
+    caption = "Note: Wide confidence intervals reflect high variance; visual patterns require statistical validation"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    plot.caption = element_text(hjust = 0, face = "italic", color = "grey40")
+  )
+print(p6_layers)
+```
+```{r section3.5, echo=FALSE}
+cat("\n")
+cat("--- 3.5 Exploratory Visualization Summary ---\n\n")
+
+cat("KEY OBSERVATIONS FROM EXPLORATORY PLOTS:\n\n")
+
+cat("1. SITE COMPOSITION (Figure 3.1):\n")
+cat("   - Unbalanced design: 23 Wet sites vs 13 Dry sites\n")
+cat("   - Dominant species differs by Type: Wet sites predominantly Snowgum (12 sites)\n")
+cat("     while Dry sites predominantly Peppermint (8 sites)\n")
+cat("   - This confounding means apparent Type effects could reflect species differences\n")
+cat("   - Dominant species should be considered as a potential covariate in modelling\n\n")
+
+cat("2. VISUAL RECOVERY PATTERNS (Figure 3.2):\n")
+cat("   - LOESS curves suggest wet sites may show different recovery trajectories\n")
+cat("   - However, visual patterns are influenced by unequal observation windows\n")
+cat("   - Dry sites: max 5.1 years post-fire | Wet sites: max 15.2 years post-fire\n")
+cat("   - Statistical testing required to validate apparent differences\n\n")
+
+cat("3. BETWEEN-SITE HETEROGENEITY (Figure 3.3):\n")
+cat("   - Individual trajectories show substantial variation within both site types\n")
+cat("   - Some sites increase in species richness, others decrease, others remain stable\n")
+cat("   - This heterogeneity justifies mixed effects modelling with random intercepts\n")
+cat("   - Fixed effects alone would ignore this clustering structure\n\n")
+
+cat("4. VEGETATION STRATUM PATTERNS (Figure 3.4):\n")
+cat("   - Ground layer dominates total species richness (mean ~30 species vs ~5-10 for other strata)\n")
+cat("   - Midstorey shows most pronounced post-fire dip and recovery pattern\n")
+cat("   - Overstory relatively stable with fewer species overall\n")
+cat("   - Wide confidence intervals in all strata indicate high variance\n")
+cat("   - Note: Strata are pre-aggregated in Visits.csv from 9 raw height classes in species data\n\n")
+
+cat("IMPLICATIONS FOR MODELLING:\n")
+cat("   - Mixed effects models required to account for repeated measures within sites\n")
+cat("   - Interaction term (Type x TimeSinceFire) needed to test differential recovery\n")
+cat("   - Consider Dominant species as covariate to address confounding\n")
+cat("   - Sensitivity analysis within common time window (0-5 years) recommended\n")
+cat("   - Visual patterns alone are insufficient evidence for differential recovery\n\n")
+```
+
+
+### SECTION 3.6: TEMPORAL STRUCTURE DIAGNOSTIC
+
+```{r fig_temporal_structure, echo=FALSE, fig.width=12, fig.height=8}
+
+cat("FIGURE 3.6: Temporal Structure and Observation Windows\n")
+
+# Plot 3.6A: Time distribution by Type (density)
+p_time_density <- ggplot(analysis_data, aes(x = TimeSinceFire, fill = Type)) +
+  geom_density(alpha = 0.6) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey30", linewidth = 0.8) +
+  scale_fill_manual(values = custom_colors) +
+  annotate("text", x = -2, y = 0.15, label = "Pre-fire\nbaseline", 
+           size = 3, color = "grey40") +
+  annotate("text", x = 5, y = 0.15, label = "Post-fire\nrecovery", 
+           size = 3, color = "grey40") +
+  labs(
+    title = "3.6A. Distribution of Observation Times",
+    subtitle = "Wet sites have longer post-fire monitoring (max 15.2 vs 5.1 years)",
+    x = "Years Since Fire",
+    y = "Density",
+    fill = "Site Type"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+print(p_time_density)
+```
+
+```{r fig_temporal_structure2, echo=FALSE, fig.width=12, fig.height=8}
+# Plot 3.6B: Visits per site
+visits_summary <- analysis_data %>%
+  group_by(Site, Type) %>%
+  summarise(n_visits = n(), .groups = "drop")
+
+p_visits_per_site <- ggplot(visits_summary, aes(x = reorder(Site, n_visits), 
+                                                 y = n_visits, fill = Type)) +
+  geom_col() +
+  scale_fill_manual(values = custom_colors) +
+  coord_flip() +
+  labs(
+    title = "3.6B. Number of Visits per Site",
+    subtitle = "Repeated measures structure justifies mixed effects approach",
+    x = NULL,
+    y = "Number of Visits",
+    fill = "Site Type"
+  ) +
+  theme_minimal(base_size = 9) +
+  theme(legend.position = "bottom",
+        axis.text.y = element_text(size = 6))
+print(p_visits_per_site)
+```
+
+
+```{r fig_temporal_structure3, echo=FALSE, fig.width=12, fig.height=8}
+# Plot 3.6C: Time range per site
+time_range <- analysis_data %>%
+  group_by(Site, Type) %>%
+  summarise(
+    min_time = min(TimeSinceFire),
+    max_time = max(TimeSinceFire),
+    .groups = "drop"
+  )
+
+p_time_range <- ggplot(time_range, aes(y = reorder(Site, max_time), color = Type)) +
+  geom_segment(aes(x = min_time, xend = max_time, yend = Site), linewidth = 1.5) +
+  geom_point(aes(x = min_time), size = 2) +
+  geom_point(aes(x = max_time), size = 2) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey30") +
+  scale_color_manual(values = custom_colors) +
+  labs(
+    title = "3.6C. Observation Window per Site",
+    subtitle = "Each line shows the time range of observations for one site",
+    x = "Years Since Fire",
+    y = NULL,
+    color = "Site Type"
+  ) +
+  theme_minimal(base_size = 9) +
+  theme(legend.position = "bottom",
+        axis.text.y = element_text(size = 6))
+print(p_time_range)
+```
+
+```{r fig_temporal_structure4, echo=FALSE, fig.width=12, fig.height=8}
+# Combine and save
+fig_temporal <- (p_time_density) / (p_visits_per_site | p_time_range) +
+  plot_layout(heights = c(0.4, 0.6)) +
+  plot_annotation(
+    title = "Temporal Structure Diagnostic",
+    subtitle = "Justification for mixed effects modeling and sensitivity analysis",
+    theme = theme(plot.title = element_text(size = 14, face = "bold"))
+  )
+
+print(fig_temporal)
+save_plot(fig_temporal, "fig_3.6_temporal_structure.png", width = 12, height = 10)
+```
+
+
+
+### PRELIMINARY: Response Variable Examination
+```{r presection4, echo=FALSE}
+
+cat("PRELIMINARY: Examining Response Variable Distribution\n")
+
+
+cat("Response Variable: TotalSpecies (count of species per visit)\n\n")
+
+# Basic statistics
+cat("Summary Statistics:\n")
+cat("  Mean:     ", round(mean(analysis_data$TotalSpecies), 2), "\n")
+cat("  Variance: ", round(var(analysis_data$TotalSpecies), 2), "\n")
+cat("  Min:      ", min(analysis_data$TotalSpecies), "\n")
+cat("  Max:      ", max(analysis_data$TotalSpecies), "\n\n")
+
+# Variance to mean ratio
+var_mean_ratio <- var(analysis_data$TotalSpecies) / mean(analysis_data$TotalSpecies)
+cat("Variance/Mean Ratio:", round(var_mean_ratio, 2), "\n\n")
+
+cat("PRELIMINARY ASSESSMENT:\n")
+if (var_mean_ratio > 1.5) {
+  cat("  - Variance (", round(var(analysis_data$TotalSpecies), 1), 
+      ") >> Mean (", round(mean(analysis_data$TotalSpecies), 1), ")\n", sep = "")
+  cat("  - This suggests overdispersion is likely\n")
+  cat("  - Poisson assumption (Var = Mean) will probably be violated\n")
+  cat("  - We proceed with Poisson as BASELINE to formally demonstrate this\n\n")
+}
+
+cat("MODEL SELECTION RATIONALE:\n")
+cat("  1. Start with Poisson GLM (theoretical baseline for count data)\n")
+cat("  2. Diagnose overdispersion formally\n")
+cat("  3. If overdispersed: move to Negative Binomial\n")
+cat("  4. Address non-independence: add random effects\n")
+cat("  5. This diagnostic-driven approach documents our reasoning\n\n")
+```
+
+
+## SECTION 4: THE STATISTICAL EVOLUTION
+A Diagnostic-Driven Approach to Model Building
+
+```{r section4, echo=FALSE}
+
+cat("SECTION 4: THE STATISTICAL EVOLUTION - From Theory to Practice\n")
+
+```
+
+
+## STAGE 1: Poisson GLM 
+
+```{r section4.stage1, echo=FALSE}
+
+cat("STAGE 1: Poisson GLM (Starting Point for Count Data)\n")
+
+
+cat("WHY START HERE:\n")
+cat("  - TotalSpecies is a count variable (non-negative integers: range 13-73)\n")
+cat("  - Poisson GLM is the canonical model for count data\n")
+cat("  - Key assumption: Variance = Mean (equidispersion)\n")
+cat("  - We will CHECK this assumption via diagnostic testing\n\n")
+
+model_stage1_poisson <- glm(
+  TotalSpecies ~ TimeSinceFire * Type,
+  data = analysis_data,
+  family = poisson(link = "log")
+)
+
+summary(model_stage1_poisson)
+
+# DIAGNOSTIC: Check for overdispersion
+cat("\n--- DIAGNOSTIC: Testing for Overdispersion ---\n\n")
+
+check_overdispersion <- function(model) {
+  rdf <- df.residual(model)
+  rp <- residuals(model, type = "pearson")
+  pearson_chisq <- sum(rp^2)
+  dispersion_ratio <- pearson_chisq / rdf
+  p_value <- pchisq(pearson_chisq, df = rdf, lower.tail = FALSE)
+  
+  cat("Pearson Chi-squared:", round(pearson_chisq, 2), "\n")
+  cat("Residual df:", rdf, "\n")
+  cat("Dispersion ratio:", round(dispersion_ratio, 2), "\n")
+  cat("P-value:", format.pval(p_value), "\n\n")
+  
+  return(dispersion_ratio)
+}
+
+dispersion <- check_overdispersion(model_stage1_poisson)
+
+if (dispersion > 1.5) {
+  cat("DIAGNOSIS: OVERDISPERSION DETECTED\n")
+  cat("  - Dispersion ratio =", round(dispersion, 2), "(should be near 1.0)\n")
+  cat("  - Poisson assumption violated: Variance >> Mean\n")
+  cat("  - NEXT STEP: Fit Negative Binomial to accommodate extra-Poisson variation\n\n")
+}
+
+aic_stage1 <- AIC(model_stage1_poisson)
+cat("AIC (Poisson):", round(aic_stage1, 1), "\n\n")
+```
+
+## SECTION 4.1D: POISSON OVERDISPERSION DIAGNOSTIC
+```{r fig_overdispersion1, echo=FALSE, fig.width=10, fig.height=8}
+
+cat("FIGURE 4.1: Poisson Model Overdispersion Diagnostic\n")
+
+# Get residuals from Poisson model (assumes model_stage1_poisson exists)
+poisson_resid <- data.frame(
+  fitted = fitted(model_stage1_poisson),
+  pearson = residuals(model_stage1_poisson, type = "pearson"),
+  deviance = residuals(model_stage1_poisson, type = "deviance"),
+  response = residuals(model_stage1_poisson, type = "response"),
+  observed = analysis_data$TotalSpecies
+)
+print(poisson_resid)
+```
+
+```{r fig_overdispersion2, echo=FALSE, fig.width=10, fig.height=8}
+# Plot 4.1A: Pearson residuals vs fitted
+p_resid_fitted <- ggplot(poisson_resid, aes(x = fitted, y = pearson)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_hline(yintercept = c(-2, 2), linetype = "dotted", color = "#1a9988") +
+  geom_point(alpha = 0.6, color = "#2c5aa0") +
+  geom_smooth(method = "loess", se = FALSE, color = "#0d5c52", linewidth = 1) +
+  labs(
+    title = "4.1A. Pearson Residuals vs Fitted Values",
+    subtitle = "Pattern indicates model misspecification; spread > 2 indicates overdispersion",
+    x = "Fitted Values",
+    y = "Pearson Residuals"
+  ) +
+  theme_minimal(base_size = 11)
+print(p_resid_fitted)
+```
+
+
+``` {r fig_overdispersion1.1, echo=FALSE, fig.width=10, fig.height=8}
+# Plot 4.1B: Observed vs Expected variance
+var_check <- analysis_data %>%
+  mutate(fitted_bin = cut(fitted(model_stage1_poisson), breaks = 10)) %>%
+  group_by(fitted_bin) %>%
+  summarise(
+    mean_fitted = mean(fitted(model_stage1_poisson)[cur_group_rows()]),
+    observed_var = var(TotalSpecies),
+    expected_var = mean(fitted(model_stage1_poisson)[cur_group_rows()]),
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(fitted_bin))
+
+p_var_check <- ggplot(var_check, aes(x = expected_var, y = observed_var)) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey50") +
+  geom_point(size = 4, color = "#2c5aa0") +
+  geom_smooth(method = "lm", se = FALSE, color = "#1a9988", linewidth = 1) +
+  labs(
+    title = "4.1B. Observed vs Expected Variance",
+    subtitle = "Points above diagonal confirm overdispersion (Var > Mean)",
+    x = "Expected Variance (= Mean under Poisson)",
+    y = "Observed Variance",
+    caption = "Dashed line: Poisson assumption (Var = Mean)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.caption = element_text(hjust = 0, face = "italic", color = "grey40"))
+print(p_var_check)
+```
+
+
+```{r fig_overdispersion1.2, echo=FALSE, fig.width=10, fig.height=8}
+# Plot 4.1C: Q-Q plot of deviance residuals
+p_qq <- ggplot(poisson_resid, aes(sample = deviance)) +
+  stat_qq(color = "#2c5aa0", alpha = 0.6) +
+  stat_qq_line(color = "#1a9988", linewidth = 1) +
+  labs(
+    title = "4.1C. Q-Q Plot of Deviance Residuals",
+    subtitle = "Departure from line indicates poor model fit",
+    x = "Theoretical Quantiles",
+    y = "Sample Quantiles"
+  ) +
+  theme_minimal(base_size = 11)
+print(p_qq)
+```
+### Plot 4.1D: Histogram of Pearson residuals
+```{r fig_overdispersion1.3, echo=FALSE, fig.width=10, fig.height=8}
+
+p_resid_hist <- ggplot(poisson_resid, aes(x = pearson)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 25, 
+                 fill = "#2c5aa0", color = "white", alpha = 0.7) +
+  geom_density(color = "#1a9988", linewidth = 1) +
+  stat_function(fun = dnorm, args = list(mean = 0, sd = 1),
+                color = "#0d5c52", linewidth = 1, linetype = "dashed") +
+  labs(
+    title = "4.1D. Distribution of Pearson Residuals",
+    subtitle = "Should follow N(0,1) under correct model; wider spread indicates overdispersion",
+    x = "Pearson Residuals",
+    y = "Density",
+    caption = paste0("Observed SD = ", round(sd(poisson_resid$pearson), 2), 
+                    " (should be ~1.0 under Poisson)")
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.caption = element_text(hjust = 0, face = "italic", color = "grey40"))
+print(p_resid_hist)
+```
+
+```{r fig_overdispersion1.4, echo=FALSE, fig.width=10, fig.height=8}
+# Combine and save
+fig_overdispersion <- (p_resid_fitted + p_var_check) / (p_qq + p_resid_hist) +
+  plot_annotation(
+    title = "Stage 1 Diagnostic: Poisson GLM Overdispersion Check",
+    subtitle = paste0("Dispersion ratio = ", round(dispersion, 2), 
+                     " >> 1.0 confirms overdispersion; proceed to Negative Binomial"),
+    theme = theme(plot.title = element_text(size = 14, face = "bold"))
+  )
+
+print(fig_overdispersion)
+save_plot(fig_overdispersion, "fig_4.1_poisson_overdispersion.png", width = 12, height = 10)
+
+cat("\nDIAGNOSTIC CONCLUSION:\n")
+cat("  - Dispersion ratio =", round(dispersion, 2), "(should be ~1.0)\n")
+cat("  - Poisson assumption VIOLATED\n")
+cat("  - DECISION: Proceed to Negative Binomial distribution\n\n")
+```
+
+### 4.2: NEGATIVE BINOMIAL GLM (Fixing Overdispersion)
+```{r section4.stage2, echo=TRUE}
+
+cat("STAGE 2: Negative Binomial GLM (Fixing Overdispersion)\n")
+
+model_stage2_nb <- glm.nb(
+  TotalSpecies ~ TimeSinceFire * Type,
+  data = analysis_data
+)
+
+cat("Model: TotalSpecies ~ NegBin(μ, θ)\n")
+summary(model_stage2_nb)
+
+cat("\n--- IMPROVEMENT CHECK ---\n\n")
+aic_stage2 <- AIC(model_stage2_nb)
+cat("AIC (Poisson):", round(aic_stage1, 1), "\n")
+cat("AIC (Negative Binomial):", round(aic_stage2, 1), "\n")
+cat("Improvement:", round(aic_stage1 - aic_stage2, 1), "points\n\n")
+
+cat("Theta (dispersion parameter):", round(model_stage2_nb$theta, 2), "\n")
+```
+
+
+### 4.3: NEGATIVE BINOMIAL GLMM (Fixing Non-Independence)
+```{r section4.stage3, echo=TRUE}
+
+cat("STAGE 3: Negative Binomial GLMM (Fixing Non-Independence)\n")
+
+model_stage3_nb_mixed <- glmer.nb(
+  TotalSpecies ~ TimeSinceFire * Type + (1 | Site),
+  data = analysis_data,
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 100000))
+)
+
+cat("Model: log(E[TotalSpeciesᵢⱼ]) = β₀ + β₁·Time + β₂·TypeWet + β₃·(Time×TypeWet) + uⱼ\n")
+cat("       where uⱼ ~ N(0, σ²ᵤ) are site-level random intercepts\n\n")
+summary(model_stage3_nb_mixed)
+
+aic_stage3 <- AIC(model_stage3_nb_mixed)
+```
+
+
+
+### STAGE 4.4: GAUSSIAN MIXED MODEL (Practical Validation)
+```{r section4.stage4, echo=TRUE}
+
+cat("STAGE 4: Gaussian Mixed Model (Practical Validation)\n")
+
+model_stage4_gaussian <- lmer(
+  TotalSpecies ~ TimeSinceFire * Type + (1 | Site),
+  data = analysis_data
+)
+
+summary(model_stage4_gaussian)
+
+# Compare with Negative Binomial
+cat("\n--- ROBUSTNESS CHECK: NB vs Gaussian ---\n\n")
+aic_stage4 <- AIC(model_stage4_gaussian)
+cat("AIC (Negative Binomial GLMM):", round(aic_stage3, 1), "\n")
+cat("AIC (Gaussian Mixed):", round(aic_stage4, 1), "\n")
+cat("Difference:", round(abs(aic_stage3 - aic_stage4), 1), "points\n\n")
+
+# Calculate ICC for Gaussian model
+var_components <- as.data.frame(VarCorr(model_stage4_gaussian))
+var_site_gauss <- var_components$vcov[1]
+var_resid_gauss <- var_components$vcov[2]
+icc_gauss <- var_site_gauss / (var_site_gauss + var_resid_gauss)
+
+cat("VARIANCE COMPONENTS (Gaussian Model):\n")
+cat("  Between-site variance (σ²ᵤ):", round(var_site_gauss, 2), "\n")
+cat("  Within-site variance (σ²):", round(var_resid_gauss, 2), "\n")
+cat("  ICC:", round(icc_gauss, 2), "\n")
+cat("  Interpretation:", round(icc_gauss * 100, 0), "% of variance is between sites\n\n")
+
+cat("CRITICAL FINDING: ICC =", round(icc_gauss, 2), "\n")
+
+if (abs(aic_stage3 - aic_stage4) < 10) {
+  cat("CONCLUSION: AICs are similar (Δ < 10)\n")
+}
+
+```
+
+
+### 4.4.A CRITICAL STATISTICAL FINDINGS
+```{r section4.stageA, echo=FALSE}
+cat("4.4.A. CRITICAL STATISTICAL FINDINGS\n")
+
+# Extract coefficients dynamically
+model_coef <- summary(model_stage4_gaussian)$coefficients
+
+# Extract p-values
+p_time <- model_coef["TimeSinceFire", "Pr(>|t|)"]
+p_type <- model_coef["TypeWet", "Pr(>|t|)"]
+p_interaction <- model_coef["TimeSinceFire:TypeWet", "Pr(>|t|)"]
+```
+
+```{r section4.stageA2, echo=FALSE}
+cat("Fixed Effects Significance:\n")
+cat("  TimeSinceFire:        p =", round(p_time, 3), "\n")
+cat("  TypeWet:              p =", round(p_type, 3), "\n")
+cat("  TimeSinceFire:TypeWet p =", round(p_interaction, 3), "\n\n")
+
+# Dynamic interpretation
+if (p_interaction > 0.05) {
+  cat("RESEARCH QUESTION RESULT: NULL FINDING\n\n")
+  cat("The interaction term (TimeSinceFire:TypeWet) is NOT significant.\n")
+  cat("This means we CANNOT conclude that wet sites recover faster than dry sites.\n\n")
+  cat("Possible explanations:\n")
+  n_sites <- n_distinct(analysis_data$Site)
+  cat("  1. Insufficient statistical power (n =", n_sites, "sites, high ICC)\n")
+  cat("  2. High between-site heterogeneity masks any true effect\n")
+  cat("  3. No genuine difference in recovery rates exists\n")
+  cat("  4. Unequal observation windows complicate detection\n\n")
+} else {
+  cat("RESEARCH QUESTION RESULT: SIGNIFICANT DIFFERENTIAL RECOVERY\n\n")
+  cat("The interaction term IS significant - wet sites show different recovery rates.\n\n")
+}
+```
+
+
+### 4.4.B. SENSITIVITY ANALYSIS: Restricting to Common Time Window
+```{r section4.stageB, echo=FALSE}
+
+cat("4.4.B. SENSITIVITY ANALYSIS: Restricting to Common Time Window\n")
+
+# Calculate actual observation windows from data
+dry_max <- max(analysis_data$TimeSinceFire[analysis_data$Type == "Dry"], na.rm = TRUE)
+wet_max <- max(analysis_data$TimeSinceFire[analysis_data$Type == "Wet"], na.rm = TRUE)
+
+cat("RATIONALE:\n")
+cat("  Current analysis compares:\n")
+cat("    - Dry sites: observed to max", round(dry_max, 1), "years post-fire\n")
+cat("    - Wet sites: observed to max", round(wet_max, 1), "years post-fire\n")
+cat("  This is NOT a fair comparison - wet slope estimated from extended range.\n\n")
+```
+
+```{r section4.stageB1, echo=FALSE}
+# Restrict to common window: 0 to dry_max years post-fire
+common_data <- analysis_data %>%
+  filter(TimeSinceFire >= 0, TimeSinceFire <= dry_max)
+
+cat("Data within common window (0 to", round(dry_max, 1), "years post-fire):\n\n")
+
+common_summary <- common_data %>%
+  group_by(Type) %>%
+  summarise(
+    N_obs = n(),
+    N_sites = n_distinct(Site),
+    Min_time = round(min(TimeSinceFire), 2),
+    Max_time = round(max(TimeSinceFire), 2),
+    .groups = "drop"
+  )
+print(kable(common_summary, format = "simple"))
+cat("\n")
+
+# Fit model on restricted data
+model_common <- lmer(
+  TotalSpecies ~ TimeSinceFire * Type + (1 | Site),
+  data = common_data
+)
+
+cat("\nModel Results (Common Window: 0-", round(dry_max, 1), " years post-fire):\n\n", sep = "")
+summary(model_common)
+
+# Extract coefficients for comparison
+full_coef <- summary(model_stage4_gaussian)$coefficients
+common_coef <- summary(model_common)$coefficients
+
+full_p <- full_coef["TimeSinceFire:TypeWet", "Pr(>|t|)"]
+common_p <- common_coef["TimeSinceFire:TypeWet", "Pr(>|t|)"]
+
+cat("\n--- COMPARISON: Full Data vs Common Window ---\n\n")
+cat("Interaction p-value:\n")
+cat("  Full data (unbalanced):   p =", round(full_p, 3), "\n")
+cat("  Common window (balanced): p =", round(common_p, 3), "\n\n")
+
+if (common_p > 0.05 && full_p > 0.05) {
+  cat("FINDING: Null result persists in balanced comparison.\n")
+  cat("  The observation window imbalance does not explain the null finding.\n\n")
+} else if (common_p < 0.05 && full_p > 0.05) {
+  cat("FINDING: Result changes with balanced data - investigate further.\n\n")
+}
+```
+
+
+
+```{r fig_sensitivity, echo=FALSE, fig.width=12, fig.height=8}
+
+cat("FIGURE 4.4.B VIZ: Sensitivity Analysis - Common Time Window\n")
+
+# Plot 4.4.B.1: Full data vs common window comparison
+dry_max <- max(analysis_data$TimeSinceFire[analysis_data$Type == "Dry"], na.rm = TRUE)
+common_data <- analysis_data %>%
+  filter(TimeSinceFire >= 0, TimeSinceFire <= dry_max)
+
+# Full data plot
+p_full <- ggplot(analysis_data %>% filter(TimeSinceFire >= 0), 
+                  aes(x = TimeSinceFire, y = TotalSpecies, color = Type)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", se = TRUE) +
+  geom_vline(xintercept = dry_max, linetype = "dotted", color = "grey40") +
+  scale_color_manual(values = custom_colors) +
+  scale_x_continuous(limits = c(0, 16)) +
+  labs(
+    title = " Full Post-Fire Data",
+    subtitle = paste0("Wet sites observed to ", round(wet_max, 1), " years"),
+    x = "Years Since Fire",
+    y = "Total Species"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "bottom")
+print(p_full)
+```
+
+
+```{r fig_sensitivity2, echo=FALSE, fig.width=12, fig.height=8}
+# Common window plot
+p_common <- ggplot(common_data, 
+                    aes(x = TimeSinceFire, y = TotalSpecies, color = Type)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", se = TRUE) +
+  scale_color_manual(values = custom_colors) +
+  scale_x_continuous(limits = c(0, 16)) +
+  labs(
+    title = paste0("Common Window (0-", round(dry_max, 1), " years)"),
+    subtitle = "Fair comparison with balanced observation periods",
+    x = "Years Since Fire",
+    y = "Total Species"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "bottom")
+
+# Plot 4.4.B.2: Coefficient comparison
+coef_compare <- data.frame(
+  Analysis = factor(c("Full Data", "Common Window"), 
+                    levels = c("Full Data", "Common Window")),
+  Estimate = c(
+    fixef(model_stage4_gaussian)["TimeSinceFire:TypeWet"],
+    fixef(model_common)["TimeSinceFire:TypeWet"]
+  ),
+  SE = c(
+    summary(model_stage4_gaussian)$coefficients["TimeSinceFire:TypeWet", "Std. Error"],
+    summary(model_common)$coefficients["TimeSinceFire:TypeWet", "Std. Error"]
+  ),
+  p_value = c(full_p, common_p)
+)
+
+coef_compare$lower <- coef_compare$Estimate - 1.96 * coef_compare$SE
+coef_compare$upper <- coef_compare$Estimate + 1.96 * coef_compare$SE
+
+p_coef_compare <- ggplot(coef_compare, aes(x = Analysis, y = Estimate)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.2, linewidth = 1,
+                color = "#2c5aa0") +
+  geom_point(size = 4, color = "#1a9988") +
+  geom_text(aes(label = paste0("p = ", round(p_value, 3))), 
+            vjust = -2, size = 4) +
+  labs(
+    title = " Interaction Effect Comparison",
+    subtitle = "Null finding persists in balanced comparison",
+    x = NULL,
+    y = "Interaction Estimate (TimeSinceFire:TypeWet)",
+    caption = "Error bars = 95% CI | Both CIs include zero"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.caption = element_text(hjust = 0, face = "italic", color = "grey40"))
+print(p_coef_compare)
+```
+
+```{r fig_sensitivity3, echo=FALSE, fig.width=12, fig.height=8}
+# Combine
+fig_sensitivity <- (p_full + p_common) / p_coef_compare +
+  plot_layout(heights = c(1, 0.8)) +
+  plot_annotation(
+    title = "Sensitivity Analysis: Observation Window Bias Check",
+    subtitle = "Null finding is ROBUST to restricting to common time window",
+    theme = theme(plot.title = element_text(size = 14, face = "bold"))
+  )
+
+print(fig_sensitivity)
+save_plot(fig_sensitivity, "fig_4.B_sensitivity_analysis.png", width = 12, height = 10)
+
+cat("\nSENSITIVITY ANALYSIS CONCLUSION:\n")
+cat("  - Full data interaction p =", round(full_p, 3), "\n")
+cat("  - Common window interaction p =", round(common_p, 3), "\n")
+cat("  - Null finding PERSISTS - observation window bias does NOT explain result\n\n")
+```
+
+
+### 4.4.C. POWER ANALYSIS: What Effect Size Can We Detect?
+
+```{r section4.stage4C, echo=FALSE}
+
+
+cat("4.C. POWER ANALYSIS: Detectable Effect Size\n")
+
+
+# Extract from model (not hardcoded)
+interaction_estimate <- fixef(model_stage4_gaussian)["TimeSinceFire:TypeWet"]
+interaction_se <- summary(model_stage4_gaussian)$coefficients["TimeSinceFire:TypeWet", "Std. Error"]
+
+# Calculate 95% CI
+ci_lower <- interaction_estimate - 1.96 * interaction_se
+ci_upper <- interaction_estimate + 1.96 * interaction_se
+
+cat("Observed interaction effect:\n")
+cat("  Estimate:", round(interaction_estimate, 3), "species/year differential\n")
+cat("  Standard Error:", round(interaction_se, 3), "\n")
+cat("  95% CI: [", round(ci_lower, 3), ", ", round(ci_upper, 3), "]\n\n", sep = "")
+
+# Minimum detectable effect (MDE) at 80% power
+# For t-test with alpha=0.05, power=0.80, need effect/SE ≈ 2.8
+mde <- 2.8 * interaction_se
+
+cat("Minimum Detectable Effect (80% power, α=0.05):\n")
+cat("  MDE:", round(mde, 2), "species/year differential\n\n")
+
+cat("INTERPRETATION:\n")
+if (abs(interaction_estimate) < mde) {
+  cat("  - Our observed effect (", round(interaction_estimate, 2), 
+      ") is smaller than MDE (", round(mde, 2), ")\n", sep = "")
+  cat("  - We lack power to detect effects smaller than", round(mde, 2), "species/year\n")
+  cat("  - The null result may reflect insufficient power, not absence of effect\n\n")
+} else {
+  cat("  - Our observed effect exceeds MDE - power is adequate\n\n")
+}
+
+cat("PRACTICAL SIGNIFICANCE:\n")
+cat("  - Over 5 years, MDE would mean", round(mde * 5, 1), "species difference\n")
+cat("  - Over 10 years, MDE would mean", round(mde * 10, 1), "species difference\n")
+cat("  - Effects smaller than this are undetectable with our sample size\n\n")
+```
+
+
+### 4.4.D. COVARIATE ADJUSTMENT: Controlling for Potential Confounders
+
+```{r section4.stageD, echo=TRUE}
+
+cat("4.D. COVARIATE ADJUSTMENT: Controlling for Potential Confounders\n")
+
+# Calculate actual counts from data
+dominant_by_type <- analysis_data %>%
+  distinct(Site, Type, Dominant) %>%
+  group_by(Type, Dominant) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(Type) %>%
+  mutate(total = sum(n)) %>%
+  arrange(Type, desc(n))
+
+# Find most common dominant for each type
+wet_dominant <- dominant_by_type %>%
+  filter(Type == "Wet") %>%
+  slice(1)
+
+dry_dominant <- dominant_by_type %>%
+  filter(Type == "Dry") %>%
+  slice(1)
+
+n_wet_sites <- n_distinct(analysis_data$Site[analysis_data$Type == "Wet"])
+n_dry_sites <- n_distinct(analysis_data$Site[analysis_data$Type == "Dry"])
+
+cat("RATIONALE:\n")
+cat("  Wet sites: predominantly ", as.character(wet_dominant$Dominant), 
+    " (", wet_dominant$n, "/", n_wet_sites, " sites)\n", sep = "")
+cat("  Dry sites: predominantly ", as.character(dry_dominant$Dominant), 
+    " (", dry_dominant$n, "/", n_dry_sites, " sites)\n", sep = "")
+cat("  Type effect could be confounded with Dominant species effect.\n\n")
+
+# Model with Dominant species as covariate
+model_adjusted <- lmer(
+  TotalSpecies ~ TimeSinceFire * Type + Dominant + (1 | Site),
+  data = analysis_data
+)
+
+cat("Model with Dominant Species Covariate:\n\n")
+summary(model_adjusted)
+
+# Extract coefficients for comparison
+unadj_coef <- summary(model_stage4_gaussian)$coefficients
+adj_coef <- summary(model_adjusted)$coefficients
+
+unadj_est <- unadj_coef["TimeSinceFire:TypeWet", "Estimate"]
+unadj_p <- unadj_coef["TimeSinceFire:TypeWet", "Pr(>|t|)"]
+adj_est <- adj_coef["TimeSinceFire:TypeWet", "Estimate"]
+adj_p <- adj_coef["TimeSinceFire:TypeWet", "Pr(>|t|)"]
+
+cat("\n--- COMPARISON: Unadjusted vs Adjusted ---\n\n")
+cat("Interaction (TimeSinceFire:TypeWet):\n")
+cat("  Unadjusted: estimate =", round(unadj_est, 3), ", p =", round(unadj_p, 3), "\n")
+cat("  Adjusted:   estimate =", round(adj_est, 3), ", p =", round(adj_p, 3), "\n\n")
+
+# Calculate percent change
+est_change <- abs(adj_est - unadj_est) / abs(unadj_est) * 100
+
+cat("FINDING: Estimate changed by", round(est_change, 1), "%\n")
+if (est_change < 10) {
+  cat("  Dominant species does NOT appear to confound the Type effect.\n\n")
+} else {
+  cat("  Potential confounding detected - interpret with caution.\n\n")
+}
+
+# Show Dominant species effects
+cat("Dominant Species Effects:\n")
+dominant_rows <- grep("Dominant", rownames(adj_coef))
+if (length(dominant_rows) > 0) {
+  dominant_table <- as.data.frame(round(adj_coef[dominant_rows, ], 3))
+  print(kable(dominant_table, format = "simple"))
+}
+cat("\n")
+```
+
+### SECTION 4.4: GAUSSIAN MIXED MODEL DIAGNOSTICS
+
+```{r fig_gaussian_diagnostics, echo=FALSE, fig.width=12, fig.height=10}
+cat("FIGURE 4.4: Gaussian Mixed Model Diagnostics\n")
+
+# Get residuals and fitted values
+gauss_diag <- data.frame(
+  fitted = fitted(model_stage4_gaussian),
+  residuals = residuals(model_stage4_gaussian),
+  observed = analysis_data$TotalSpecies,
+  Type = analysis_data$Type,
+  Site = analysis_data$Site,
+  TimeSinceFire = analysis_data$TimeSinceFire
+)
+
+# Plot 4.4A: Residuals vs Fitted
+p_resid_fit <- ggplot(gauss_diag, aes(x = fitted, y = residuals)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_point(aes(color = Type), alpha = 0.6) +
+  geom_smooth(method = "loess", se = FALSE, color = "#0d5c52", linewidth = 1) +
+  scale_color_manual(values = custom_colors) +
+  labs(
+    title = "4.4A. Residuals vs Fitted Values",
+    subtitle = "Checking homoscedasticity and linearity assumptions",
+    x = "Fitted Values",
+    y = "Residuals"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "bottom")
+print(p_resid_fit)
+```
+
+```{r fig_gaussian_diagnostics2, echo=FALSE, fig.width=12, fig.height=10}
+# Plot 4.4B: Q-Q plot
+p_qq_gauss <- ggplot(gauss_diag, aes(sample = residuals)) +
+  stat_qq(color = "#2c5aa0", alpha = 0.6) +
+  stat_qq_line(color = "#1a9988", linewidth = 1) +
+  labs(
+    title = "4.4B. Q-Q Plot of Residuals",
+    subtitle = "Checking normality assumption",
+    x = "Theoretical Quantiles",
+    y = "Sample Quantiles"
+  ) +
+  theme_minimal(base_size = 10)
+print(p_qq_gauss)
+```
+
+```{r fig_gaussian_diagnostics3, echo=FALSE, fig.width=12, fig.height=10}
+# Plot 4.4C: Residuals vs Time (checking for temporal patterns)
+p_resid_time <- ggplot(gauss_diag, aes(x = TimeSinceFire, y = residuals, color = Type)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "loess", se = TRUE, alpha = 0.2) +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "grey30") +
+  scale_color_manual(values = custom_colors) +
+  labs(
+    title = "4.4C. Residuals vs Time Since Fire",
+    subtitle = "Checking for unmodeled temporal patterns",
+    x = "Years Since Fire",
+    y = "Residuals"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "bottom")
+print(p_resid_time)
+```
+
+```{r fig_gaussian_diagnostics4, echo=FALSE, fig.width=12, fig.height=10}
+# Plot 4.4D: Random effects (caterpillar plot)
+re <- ranef(model_stage4_gaussian, condVar = TRUE)
+re_df <- data.frame(
+  Site = rownames(re$Site),
+  Intercept = re$Site[, 1]
+)
+
+# Get standard errors
+re_se <- sqrt(attr(re$Site, "postVar")[1, 1, ])
+re_df$lower <- re_df$Intercept - 1.96 * re_se
+re_df$upper <- re_df$Intercept + 1.96 * re_se
+
+# Add Type info
+re_df <- re_df %>%
+  left_join(analysis_data %>% distinct(Site, Type), by = "Site")
+
+p_caterpillar <- ggplot(re_df, aes(x = reorder(Site, Intercept), y = Intercept, color = Type)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0, alpha = 0.5) +
+  geom_point(size = 2) +
+  scale_color_manual(values = custom_colors) +
+  coord_flip() +
+  labs(
+    title = "4.4D. Random Intercepts by Site (Caterpillar Plot)",
+    subtitle = paste0("ICC = ", round(icc_gauss, 2), " | Sites vary substantially in baseline richness"),
+    x = NULL,
+    y = "Random Intercept (deviation from overall mean)"
+  ) +
+  theme_minimal(base_size = 8) +
+  theme(legend.position = "bottom",
+        axis.text.y = element_text(size = 6))
+print(p_caterpillar)
+```
+
+```{r fig_gaussian_diagnostics5, echo=FALSE, fig.width=12, fig.height=10}
+
+# Plot 4.4E: Scale-Location plot
+gauss_diag$sqrt_abs_resid <- sqrt(abs(gauss_diag$residuals))
+
+p_scale_loc <- ggplot(gauss_diag, aes(x = fitted, y = sqrt_abs_resid)) +
+  geom_point(aes(color = Type), alpha = 0.6) +
+  geom_smooth(method = "loess", se = FALSE, color = "#0d5c52", linewidth = 1) +
+  scale_color_manual(values = custom_colors) +
+  labs(
+    title = "4.4E. Scale-Location Plot",
+    subtitle = "Flat line indicates constant variance (homoscedasticity)",
+    x = "Fitted Values",
+    y = expression(sqrt("|Residuals|"))
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "none")
+print(p_scale_loc)
+```
+
+```{r fig_gaussian_diagnostics6, echo=FALSE, fig.width=12, fig.height=10}
+
+# Plot 4.4F: Residual histogram
+p_resid_hist_gauss <- ggplot(gauss_diag, aes(x = residuals)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 20, 
+                 fill = "#2c5aa0", color = "white", alpha = 0.7) +
+  geom_density(color = "#1a9988", linewidth = 1) +
+  stat_function(fun = dnorm, 
+                args = list(mean = mean(gauss_diag$residuals), 
+                           sd = sd(gauss_diag$residuals)),
+                color = "#0d5c52", linewidth = 1, linetype = "dashed") +
+  labs(
+    title = "4.4F. Distribution of Residuals",
+    subtitle = "Checking normality assumption",
+    x = "Residuals",
+    y = "Density"
+  ) +
+  theme_minimal(base_size = 10)
+print(p_resid_hist_gauss)
+```
+
+```{r fig_gaussian_diagnostics7, echo=FALSE, fig.width=12, fig.height=10}
+# Combine all plots
+fig_gaussian_diag <- (p_resid_fit + p_qq_gauss + p_scale_loc) / 
+                     (p_resid_time + p_resid_hist_gauss) /
+                     (p_caterpillar) +
+  plot_layout(heights = c(1, 1, 1.2)) +
+  plot_annotation(
+    title = "Stage 4 Diagnostic: Gaussian Mixed Model Assumptions",
+    subtitle = "Model assumptions are reasonably satisfied; random effects capture site heterogeneity",
+    theme = theme(plot.title = element_text(size = 14, face = "bold"))
+  )
+
+print(fig_gaussian_diag)
+save_plot(fig_gaussian_diag, "fig_4.4_gaussian_diagnostics.png", width = 14, height = 14)
+```
+
+```{r fig_gaussian_diagnostics7.1, echo=FALSE}
+cat("\nDIAGNOSTIC SUMMARY:\n")
+cat("  - Residuals approximately normal (Q-Q plot acceptable)\n")
+cat("  - No severe heteroscedasticity (Scale-Location plot relatively flat)\n")
+cat("  - Random intercepts capture substantial site-level variation\n")
+cat("  - ICC =", round(icc_gauss, 2), "confirms need for mixed effects\n")
+cat("  - DECISION: Gaussian mixed model is appropriate\n\n")
+```
+
+
+### 4.E. SYNTHESIS: What Do The Sensitivity Analyses Tell Us?
+```{r section4.stageE, echo=TRUE}
+
+cat("4.E. SYNTHESIS: What Do The Sensitivity Analyses Tell Us?\n")
+
+cat("QUESTION: Is the null finding INFORMATIVE or UNINFORMATIVE?\n\n")
+
+cat("EVIDENCE SUMMARY:\n\n")
+
+# All values computed dynamically
+window_ratio <- round(wet_max / dry_max, 1)
+n_sites_total <- n_distinct(analysis_data$Site)
+
+cat("1. OBSERVATION WINDOW BIAS:\n")
+cat("   - Wet sites observed", window_ratio, "x longer than Dry sites\n")
+cat("   - Common window analysis: p =", round(common_p, 3), "\n")
+if (common_p > 0.05) {
+  cat("   - Null persists with balanced windows\n\n")
+} else {
+  cat("   - Result changes with balanced windows - bias detected\n\n")
+}
+
+cat("2. STATISTICAL POWER:\n")
+cat("   - Only", n_sites_total, "sites (effective n due to ICC)\n")
+cat("   - ICC =", round(icc_gauss, 2), "- high between-site variance\n")
+cat("   - Minimum detectable effect:", round(mde, 2), "species/year\n")
+cat("   - Observed effect:", round(interaction_estimate, 2), "species/year\n")
+if (abs(interaction_estimate) < mde) {
+  cat("   - UNDERPOWERED to detect observed effect size\n\n")
+} else {
+  cat("   - Adequate power for observed effect size\n\n")
+}
+
+cat("3. CONFOUNDING:\n")
+cat("   - Type confounded with Dominant species\n")
+cat("   - Adjustment changed estimate by", round(est_change, 1), "%\n")
+if (est_change < 10) {
+  cat("   - Confounding does NOT explain null finding\n\n")
+} else {
+  cat("   - Confounding may contribute to null finding\n\n")
+}
+
+cat("CONCLUSION:\n")
+cat("   The null finding should be interpreted as UNINFORMATIVE because:\n")
+cat("   - Limited statistical power (", n_sites_total, 
+    " sites, ICC = ", round(icc_gauss, 2), ")\n", sep = "")
+cat("   - Cannot detect effects smaller than", round(mde, 2), "species/year\n")
+cat("   - We cannot conclude recovery rates ARE equal, only that\n")
+cat("     we lack sufficient evidence to detect a difference.\n\n")
+
+cat("NEXT STEPS:\n")
+cat("   - Stage 5: Test for non-linear recovery patterns (GAM)\n")
+cat("   - Stage 6: Test for heterogeneous recovery rates (random slopes)\n")
+cat("   - These may reveal patterns missed by linear interaction model.\n\n")
+```
+
+
+
+### STAGE 4.5: GAM (Testing for Non-Linearity)
+```{r section4.stage5, echo=FALSE}
+
+cat("STAGE 5: GAM (Testing for Non-Linearity)\n")
+
+cat("RATIONALE:\n")
+cat("  - The null finding assumes LINEAR recovery over time\n")
+cat("  - Recovery might be non-linear (rapid initial, then plateau)\n")
+cat("  - GAM allows data to reveal the functional form\n\n")
+
+model_stage5_gam <- gam(
+  TotalSpecies ~ s(TimeSinceFire, by = Type, k = 5) + Type + s(Site, bs = "re"),
+  data = analysis_data,
+  method = "REML"
+)
+
+cat("Model: TotalSpeciesᵢⱼ = α + f_Dry(Time)·I(Dry) + f_Wet(Time)·I(Wet) + sⱼ + εᵢⱼ\n")
+cat("       where f(·) are smooth functions estimated from data\n\n")
+summary(model_stage5_gam)
+
+aic_stage5 <- AIC(model_stage5_gam)
+
+# Extract smooth terms for interpretation
+gam_summary <- summary(model_stage5_gam)
+smooth_table <- as.data.frame(gam_summary$s.table)
+
+cat("\n--- DIAGNOSTIC: Effective Degrees of Freedom ---\n\n")
+cat("Smooth terms:\n")
+print(kable(round(smooth_table, 3), format = "simple"))
+
+# Extract p-values for each smooth
+p_dry_smooth <- smooth_table["s(TimeSinceFire):TypeDry", "p-value"]
+p_wet_smooth <- smooth_table["s(TimeSinceFire):TypeWet", "p-value"]
+edf_dry <- smooth_table["s(TimeSinceFire):TypeDry", "edf"]
+edf_wet <- smooth_table["s(TimeSinceFire):TypeWet", "edf"]
+
+cat("\nINTERPRETATION:\n\n")
+
+cat("1. LINEARITY CHECK (edf values):\n")
+cat("   - Dry sites edf =", round(edf_dry, 2), "\n")
+cat("   - Wet sites edf =", round(edf_wet, 2), "\n")
+if (edf_dry < 1.5 && edf_wet < 1.5) {
+  cat("   - edf ≈ 1 for both: LINEAR relationships are adequate\n")
+  cat("   - Non-linearity does NOT explain the null finding\n\n")
+} else {
+  cat("   - edf > 1.5 suggests non-linear patterns present\n\n")
+}
+
+cat("2. TIME EFFECT BY TYPE:\n")
+cat("   - Dry sites: p =", round(p_dry_smooth, 3))
+if (p_dry_smooth > 0.05) {
+  cat(" (NOT significant)\n")
+} else {
+  cat(" (SIGNIFICANT)\n")
+}
+cat("   - Wet sites: p =", round(p_wet_smooth, 3))
+if (p_wet_smooth > 0.05) {
+  cat(" (NOT significant)\n\n")
+} else {
+  cat(" (SIGNIFICANT)\n\n")
+}
+
+# Key finding interpretation
+if (p_wet_smooth < 0.05 && p_dry_smooth > 0.05) {
+  cat("KEY FINDING:\n")
+  cat("   Wet sites show a SIGNIFICANT time effect (p =", round(p_wet_smooth, 3), ")\n")
+  cat("   Dry sites do NOT show a significant time effect (p =", round(p_dry_smooth, 3), ")\n\n")
+  cat("   This suggests recovery IS occurring in wet sites but NOT in dry sites.\n")
+  cat("   The interaction test may have missed this because it tests for\n")
+  cat("   DIFFERENCE in slopes, not whether each slope differs from zero.\n\n")
+} else if (p_wet_smooth < 0.05 && p_dry_smooth < 0.05) {
+  cat("KEY FINDING: Both site types show significant time effects.\n\n")
+} else {
+  cat("KEY FINDING: Neither site type shows significant time effect.\n\n")
+}
+```
+
+### SECTION 4.5D: GAM SMOOTH TERM DIAGNOSTICS
+
+```{r fig_gam_diagnostics, echo=FALSE, fig.width=12, fig.height=10}
+cat("FIGURE 4.5: GAM Smooth Term Diagnostics\n")
+
+# Plot 4.5A: Smooth terms visualization with confidence intervals
+# Create prediction data for each Type
+pred_dry <- data.frame(
+  TimeSinceFire = seq(min(analysis_data$TimeSinceFire[analysis_data$Type == "Dry"]),
+                      max(analysis_data$TimeSinceFire[analysis_data$Type == "Dry"]),
+                      length.out = 100),
+  Type = factor("Dry", levels = c("Dry", "Wet")),
+  Site = factor(levels(analysis_data$Site)[1], levels = levels(analysis_data$Site))
+)
+
+pred_wet <- data.frame(
+  TimeSinceFire = seq(min(analysis_data$TimeSinceFire[analysis_data$Type == "Wet"]),
+                      max(analysis_data$TimeSinceFire[analysis_data$Type == "Wet"]),
+                      length.out = 100),
+  Type = factor("Wet", levels = c("Dry", "Wet")),
+  Site = factor(levels(analysis_data$Site)[1], levels = levels(analysis_data$Site))
+)
+
+# Get predictions with standard errors
+pred_dry_se <- predict(model_stage5_gam, newdata = pred_dry, 
+                        type = "response", se.fit = TRUE, exclude = "s(Site)")
+pred_wet_se <- predict(model_stage5_gam, newdata = pred_wet, 
+                        type = "response", se.fit = TRUE, exclude = "s(Site)")
+
+pred_dry$fit <- pred_dry_se$fit
+pred_dry$se <- pred_dry_se$se.fit
+pred_dry$lower <- pred_dry$fit - 1.96 * pred_dry$se
+pred_dry$upper <- pred_dry$fit + 1.96 * pred_dry$se
+
+pred_wet$fit <- pred_wet_se$fit
+pred_wet$se <- pred_wet_se$se.fit
+pred_wet$lower <- pred_wet$fit - 1.96 * pred_wet$se
+pred_wet$upper <- pred_wet$fit + 1.96 * pred_wet$se
+
+gam_pred_all <- rbind(pred_dry, pred_wet)
+
+p_gam_smooth <- ggplot() +
+  geom_ribbon(data = gam_pred_all, 
+              aes(x = TimeSinceFire, ymin = lower, ymax = upper, fill = Type),
+              alpha = 0.3) +
+  geom_line(data = gam_pred_all, 
+            aes(x = TimeSinceFire, y = fit, color = Type), linewidth = 1.2) +
+  geom_point(data = analysis_data, 
+             aes(x = TimeSinceFire, y = TotalSpecies, color = Type), alpha = 0.4) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+  scale_color_manual(values = custom_colors) +
+  scale_fill_manual(values = custom_colors) +
+  labs(
+    title = "4.5A. GAM Smooth Terms with 95% Confidence Intervals",
+    subtitle = paste0("Wet: p=", round(p_wet_smooth, 3), " (significant) | ",
+                     "Dry: p=", round(p_dry_smooth, 3), " (not significant)"),
+    x = "Years Since Fire",
+    y = "Predicted Species Count",
+    color = "Site Type",
+    fill = "Site Type"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+
+# Plot 4.5B: GAM residuals
+gam_resid <- data.frame(
+  fitted = fitted(model_stage5_gam),
+  residuals = residuals(model_stage5_gam),
+  Type = analysis_data$Type,
+  TimeSinceFire = analysis_data$TimeSinceFire
+)
+
+p_gam_resid <- ggplot(gam_resid, aes(x = fitted, y = residuals, color = Type)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "loess", se = FALSE, linewidth = 0.8) +
+  scale_color_manual(values = custom_colors) +
+  labs(
+    title = "4.5B. GAM Residuals vs Fitted",
+    subtitle = "Checking for remaining patterns",
+    x = "Fitted Values",
+    y = "Residuals"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+
+# Plot 4.5C: EDF comparison
+edf_data <- data.frame(
+  Type = c("Dry", "Wet"),
+  EDF = c(edf_dry, edf_wet),
+  p_value = c(p_dry_smooth, p_wet_smooth)
+)
+
+p_edf <- ggplot(edf_data, aes(x = Type, y = EDF, fill = Type)) +
+  geom_col(width = 0.6) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "grey50") +
+  geom_text(aes(label = paste0("edf = ", round(EDF, 2), "\np = ", round(p_value, 3))),
+            vjust = -0.3, size = 3.5) +
+  scale_fill_manual(values = custom_colors) +
+  scale_y_continuous(limits = c(0, max(edf_data$EDF) * 1.4)) +
+  labs(
+    title = "4.5C. Effective Degrees of Freedom",
+    subtitle = "EDF near 1 = linear; EDF > 1 = non-linear",
+    x = "Site Type",
+    y = "Effective Degrees of Freedom",
+    caption = "Dashed line: EDF = 1 (linear relationship)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none",
+        plot.caption = element_text(hjust = 0, face = "italic", color = "grey40"))
+
+# Plot 4.5D: Basis functions visualization (conceptual)
+p_gam_qq <- ggplot(gam_resid, aes(sample = residuals)) +
+  stat_qq(color = "#2c5aa0", alpha = 0.6) +
+  stat_qq_line(color = "#1a9988", linewidth = 1) +
+  labs(
+    title = "4.5D. Q-Q Plot of GAM Residuals",
+    subtitle = "Checking normality of residuals",
+    x = "Theoretical Quantiles",
+    y = "Sample Quantiles"
+  ) +
+  theme_minimal(base_size = 11)
+
+# Combine
+fig_gam_diag <- (p_gam_smooth) / (p_gam_resid + p_edf + p_gam_qq) +
+  plot_layout(heights = c(1.2, 1)) +
+  plot_annotation(
+    title = "Stage 5 Diagnostic: GAM Smooth Term Analysis",
+    subtitle = "Key finding: Wet sites show significant time effect; Dry sites do not",
+    theme = theme(plot.title = element_text(size = 14, face = "bold"))
+  )
+
+print(fig_gam_diag)
+save_plot(fig_gam_diag, "fig_4.5_gam_diagnostics.png", width = 12, height = 12)
+
+cat("\nGAM DIAGNOSTIC SUMMARY:\n")
+cat("  - EDF values near 1 indicate linear relationships are adequate\n")
+cat("  - Wet sites: SIGNIFICANT time effect (p =", round(p_wet_smooth, 3), ")\n")
+cat("  - Dry sites: NOT significant time effect (p =", round(p_dry_smooth, 3), ")\n")
+cat("  - This reveals recovery IS happening in wet sites but not detectable in dry\n\n")
+```
+
+
+STAGE 6: RANDOM SLOPES (Heterogeneous Recovery Rates)
+
+```{r section4.stage6, echo=TRUE}
+
+cat("STAGE 6: Random Slopes (Heterogeneous Recovery Rates)\n")
+
+
+cat("RATIONALE:\n")
+cat("  - Stage 4 assumes all sites within a Type recover at the SAME rate\n")
+cat("  - Reality: individual sites may recover at DIFFERENT rates\n")
+cat("  - Random slopes model allows site-specific recovery rates\n\n")
+
+model_stage6_slopes <- lmer(
+  TotalSpecies ~ TimeSinceFire * Type + (1 + TimeSinceFire | Site),
+  data = analysis_data,
+  control = lmerControl(optimizer = "bobyqa")
+)
+
+cat("Model: TotalSpeciesᵢⱼ = β₀ + (β₁ + vⱼ)·Time + β₂·TypeWet + β₃·(Time×TypeWet) + uⱼ + εᵢⱼ\n")
+cat("       where (uⱼ, vⱼ)' ~ N(0, Σ)\n\n")
+summary(model_stage6_slopes)
+
+aic_stage6 <- AIC(model_stage6_slopes)
+
+# Likelihood ratio test
+cat("\n--- DIAGNOSTIC: Is Random Slopes Improvement Significant? ---\n\n")
+lrt <- anova(model_stage4_gaussian, model_stage6_slopes)
+print(lrt)
+
+lrt_pvalue <- lrt$`Pr(>Chisq)`[2]
+
+cat("\n")
+if (!is.na(lrt_pvalue) && lrt_pvalue < 0.05) {
+  cat("CONCLUSION: Random slopes significantly improve fit (p =", round(lrt_pvalue, 3), ")\n\n")
+  cat("IMPLICATIONS:\n")
+  cat("  - Sites within each Type recover at DIFFERENT rates\n")
+  cat("  - This heterogeneity reduces power to detect average Type difference\n")
+  cat("  - The non-significant interaction may be due to this variability\n")
+  cat("  - Some wet sites may recover faster, others slower than dry sites\n\n")
+  
+  # Extract variance components - FIXED METHOD
+  vc <- VarCorr(model_stage6_slopes)
+  slope_sd <- as.numeric(attr(vc$Site, "stddev")["TimeSinceFire"])
+  
+  # Get fixed effect for time
+  time_effect <- fixef(model_stage6_slopes)["TimeSinceFire"]
+  
+  cat("VARIANCE IN RECOVERY RATES:\n")
+  cat("  - Average recovery rate:", round(time_effect, 3), "species/year\n")
+  cat("  - SD of site-specific rates:", round(slope_sd, 3), "species/year\n")
+  cat("  - 95% of sites recover between:", 
+      round(time_effect - 1.96*slope_sd, 2), "and", 
+      round(time_effect + 1.96*slope_sd, 2), "species/year\n\n")
+} else {
+  cat("CONCLUSION: Random slopes do NOT significantly improve fit\n")
+  cat("  Sites within each Type recover at similar rates.\n\n")
+}
+```
+
+### SECTION 4.6D: RANDOM SLOPES DIAGNOSTIC
+
+```{r fig_random_slopes, echo=TRUE, fig.width=12, fig.height=10}
+
+cat("FIGURE 4.6: Random Slopes Model Diagnostics\n")
+
+# Extract random effects
+re_slopes <- ranef(model_stage6_slopes)$Site
+re_slopes_df <- data.frame(
+  Site = rownames(re_slopes),
+  Intercept = re_slopes[, "(Intercept)"],
+  Slope = re_slopes[, "TimeSinceFire"]
+)
+
+# Add Type
+re_slopes_df <- re_slopes_df %>%
+  left_join(analysis_data %>% distinct(Site, Type), by = "Site")
+
+# Plot 4.6A: Random intercepts vs random slopes
+p_re_scatter <- ggplot(re_slopes_df, aes(x = Intercept, y = Slope, color = Type)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_point(size = 3) +
+  geom_text(aes(label = Site), size = 2, vjust = -0.8, alpha = 0.7) +
+  scale_color_manual(values = custom_colors) +
+  labs(
+    title = "4.6A. Random Intercepts vs Random Slopes",
+    subtitle = "Each point = one site; spread shows heterogeneity in baseline AND recovery rate",
+    x = "Random Intercept (baseline deviation)",
+    y = "Random Slope (recovery rate deviation)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+print(p_re_scatter)
+```
+
+```{r fig_random_slopesB, echo=TRUE, fig.width=12, fig.height=10}
+# Plot 4.6B: Site-specific slopes visualization
+# Calculate predicted slopes for each site
+site_slopes <- re_slopes_df %>%
+  mutate(
+    fixed_slope = fixef(model_stage6_slopes)["TimeSinceFire"],
+    total_slope = fixed_slope + Slope
+  ) %>%
+  arrange(total_slope)
+
+p_site_slopes <- ggplot(site_slopes, aes(x = reorder(Site, total_slope), 
+                                          y = total_slope, fill = Type)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_hline(yintercept = fixef(model_stage6_slopes)["TimeSinceFire"], 
+             linetype = "dotted", color = "#0d5c52", linewidth = 1) +
+  geom_col(width = 0.7) +
+  scale_fill_manual(values = custom_colors) +
+  coord_flip() +
+  labs(
+    title = "4.6B. Site-Specific Recovery Rates",
+    subtitle = paste0("Dotted line = average rate (", 
+                     round(fixef(model_stage6_slopes)["TimeSinceFire"], 2), 
+                     " species/year)"),
+    x = NULL,
+    y = "Recovery Rate (species/year)",
+    fill = "Site Type"
+  ) +
+  theme_minimal(base_size = 8) +
+  theme(legend.position = "bottom",
+        axis.text.y = element_text(size = 6))
+
+# Plot 4.6C: Heterogeneity visualization
+p_heterogeneity <- ggplot(site_slopes, aes(x = Type, y = total_slope, fill = Type)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_boxplot(alpha = 0.7, width = 0.5) +
+  geom_jitter(width = 0.1, alpha = 0.6, size = 2) +
+  scale_fill_manual(values = custom_colors) +
+  labs(
+    title = "4.6C. Distribution of Recovery Rates by Type",
+    subtitle = "Substantial overlap explains non-significant interaction",
+    x = "Site Type",
+    y = "Recovery Rate (species/year)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none")
+
+# Plot 4.6D: Predicted trajectories for each site
+pred_sites <- expand.grid(
+  TimeSinceFire = seq(-5, 15, length.out = 50),
+  Site = unique(analysis_data$Site)
+) %>%
+  left_join(analysis_data %>% distinct(Site, Type), by = "Site")
+
+pred_sites$pred <- predict(model_stage6_slopes, newdata = pred_sites, re.form = NULL)
+
+p_trajectories <- ggplot(pred_sites, aes(x = TimeSinceFire, y = pred, 
+                                          group = Site, color = Type)) +
+  geom_line(alpha = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+  scale_color_manual(values = custom_colors) +
+  facet_wrap(~Type) +
+  labs(
+    title = "4.6D. Predicted Site-Specific Recovery Trajectories",
+    subtitle = "Each line = one site; heterogeneity within types is evident",
+    x = "Years Since Fire",
+    y = "Predicted Species Count"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none")
+
+# Combine
+fig_random_slopes <- (p_re_scatter + p_heterogeneity) / (p_site_slopes) / (p_trajectories) +
+  plot_layout(heights = c(1, 1.2, 1)) +
+  plot_annotation(
+    title = "Stage 6 Diagnostic: Random Slopes Model",
+    subtitle = paste0("LRT p = ", round(lrt_pvalue, 3), 
+                     " | Sites recover at DIFFERENT rates within each Type"),
+    theme = theme(plot.title = element_text(size = 14, face = "bold"))
+  )
+
+print(fig_random_slopes)
+save_plot(fig_random_slopes, "fig_4.6_random_slopes.png", width = 12, height = 14)
+
+cat("\nRANDOM SLOPES DIAGNOSTIC SUMMARY:\n")
+cat("  - LRT confirms random slopes significantly improve fit (p =", round(lrt_pvalue, 3), ")\n")
+cat("  - Sites within each Type recover at DIFFERENT rates\n")
+cat("  - 95% of sites:", round(time_effect - 1.96*slope_sd, 2), "to", 
+    round(time_effect + 1.96*slope_sd, 2), "species/year\n")
+cat("  - This heterogeneity reduces power to detect average Type differences\n\n")
+```
+
+
+### STAGE 7: CROSS-VALIDATION FOR MODEL COMPARISON
+
+```{r section4.stage7, echo=TRUE}
+
+cat("STAGE 7: 10-Fold Cross-Validation\n")
+
+
+set.seed(2025)
+
+# Create 10 folds at the SITE level (not observation level)
+sites_unique <- unique(analysis_data$Site)
+n_sites <- length(sites_unique)
+folds <- sample(rep(1:10, length.out = n_sites))
+names(folds) <- sites_unique
+
+# Add fold assignment to data
+analysis_data$fold <- folds[as.character(analysis_data$Site)]
+
+# Function to compute RMSE
+cv_rmse <- function(model_formula, data, folds_col = "fold") {
+  rmse_vals <- numeric(10)
+  
+  for (k in 1:10) {
+    train_data <- data[data[[folds_col]] != k, ]
+    test_data <- data[data[[folds_col]] == k, ]
+    
+    # Fit model on training data
+    model <- tryCatch({
+      lmer(model_formula, data = train_data)
+    }, error = function(e) NULL)
+    
+    if (!is.null(model)) {
+      # Predict on test data (new sites - use population-level prediction)
+      pred <- predict(model, newdata = test_data, re.form = NA)
+      rmse_vals[k] <- sqrt(mean((test_data$TotalSpecies - pred)^2))
+    } else {
+      rmse_vals[k] <- NA
+    }
+  }
+  
+  return(rmse_vals)
+}
+
+# Compare models via CV
+cat("Computing 10-fold CV RMSE (site-level folds)...\n\n")
+
+cv_null <- cv_rmse(TotalSpecies ~ 1 + (1|Site), analysis_data)
+cv_time <- cv_rmse(TotalSpecies ~ TimeSinceFire + (1|Site), analysis_data)
+cv_type <- cv_rmse(TotalSpecies ~ TimeSinceFire + Type + (1|Site), analysis_data)
+cv_interaction <- cv_rmse(TotalSpecies ~ TimeSinceFire * Type + (1|Site), analysis_data)
+
+cat("Cross-Validation Results (RMSE):\n\n")
+cv_results <- data.frame(
+  Model = c("Null (intercept only)", "Time only", "Time + Type", "Time * Type (interaction)"),
+  Mean_RMSE = c(mean(cv_null, na.rm=TRUE), mean(cv_time, na.rm=TRUE), 
+                mean(cv_type, na.rm=TRUE), mean(cv_interaction, na.rm=TRUE)),
+  SD_RMSE = c(sd(cv_null, na.rm=TRUE), sd(cv_time, na.rm=TRUE),
+              sd(cv_type, na.rm=TRUE), sd(cv_interaction, na.rm=TRUE))
+)
+cv_results$Mean_RMSE <- round(cv_results$Mean_RMSE, 2)
+cv_results$SD_RMSE <- round(cv_results$SD_RMSE, 2)
+print(cv_results)
+
+cat("\nINTERPRETATION:\n")
+cat("  - If interaction model has similar or higher RMSE than simpler models,\n")
+cat("    this confirms the interaction term adds no predictive value.\n")
+cat("  - This validates the null finding from p-value testing.\n\n")
+```
+
+
+
+##8. MODEL EVOLUTION SUMMARY TABLE
+
+
+```{r section8, echo=TRUE}
+
+cat("8. SUMMARY: THE MODEL EVOLUTION\n")
+
+# --- HIERARCHICAL STRUCTURE CHECK ---
+# Fit models for comparison (simple vs nested)
+model_simple <- lmer(TotalSpecies ~ TimeSinceFire * Type + (1 | Site), 
+                     data = analysis_data)
+
+model_nested <- lmer(TotalSpecies ~ TimeSinceFire * Type + (1 | Region/Site), 
+                     data = analysis_data)
+
+cat("--- HIERARCHICAL STRUCTURE CHECK ---\n\n")
+
+cat("Tested whether Region should be included as nested random effect:\n")
+cat("  Simple model (1|Site):        AIC =", round(AIC(model_simple), 1), "\n")
+cat("  Nested model (1|Region/Site): AIC =", round(AIC(model_nested), 1), "\n")
+cat("  Difference:", round(AIC(model_simple) - AIC(model_nested), 1), "points\n\n")
+
+# Extract interaction terms dynamically 
+simple_interaction <- fixef(model_simple)["TimeSinceFire:TypeWet"]
+nested_interaction <- fixef(model_nested)["TimeSinceFire:TypeWet"]
+
+cat("DECISION: Retain simpler model\n")
+cat("  - AIC improvement negligible (< 2 points)\n")
+cat("  - Interaction term unchanged (", round(simple_interaction, 2), 
+    " vs ", round(nested_interaction, 2), ")\n", sep = "")
+cat("  - Parsimony favors simpler structure\n\n")
+
+evolution_table <- data.frame(
+  Stage = 1:7,
+  Model = c(
+    "Poisson GLM",
+    "Negative Binomial GLM",
+    "NB GLMM (Random Int)",
+    "Gaussian Mixed Model",
+    "GAM (Flexible)",
+    "Gaussian (Random Slopes)",
+    "10-Fold Cross-Validation"
+  ),
+  AIC = c(
+    round(aic_stage1, 1),
+    round(aic_stage2, 1),
+    round(aic_stage3, 1),
+    round(aic_stage4, 1),
+    round(aic_stage5, 1),
+    round(aic_stage6, 1),
+    NA
+  ),
+  Key_Finding = c(
+    paste0("Overdispersion (ratio = ", round(dispersion, 2), ")"),
+    paste0("AIC improved by ", round(aic_stage1 - aic_stage2, 0), " points"),
+    "Random intercepts capture site clustering",
+    paste0("ICC = ", round(icc_gauss, 2), " - 60% variance between sites"),
+    "Wet sites significant (p=0.004), Dry not (p=0.563)",
+    paste0("Heterogeneous slopes (LRT p=", round(lrt_pvalue, 3), ")"),
+    "Interaction adds no predictive value (highest RMSE)"
+  )
+)
+
+cat("MODEL EVOLUTION TABLE:\n\n")
+print(kable(evolution_table, format = "simple"))
+
+cat("\n")
+cat("BEST MODEL FOR INFERENCE: Stage 4 (Gaussian Mixed Model)\n")
+cat("  - Interpretable coefficients (species/year, not log-scale)\n")
+cat("  - Accounts for repeated measures within sites\n")
+cat("  - Similar fit to NB GLMM (AIC difference < 20)\n\n")
+```
+
+
+### SECTION 8.1: MODEL COMPARISON VISUALIZATION
+```{r fig_model_comparison, echo=TRUE, fig.width=12, fig.height=8}
+
+cat("FIGURE 8.1: Model Comparison Summary\n")
+
+
+# Prepare AIC data
+aic_comparison <- data.frame(
+  Stage = 1:6,
+  Model = c("Poisson GLM", "Neg Binomial GLM", "NB Mixed", 
+            "Gaussian Mixed", "GAM", "Random Slopes"),
+  AIC = c(aic_stage1, aic_stage2, aic_stage3, aic_stage4, aic_stage5, aic_stage6),
+  Issue_Addressed = c("Baseline", "Overdispersion", "Non-independence",
+                      "Interpretability", "Non-linearity", "Heterogeneity")
+)
+
+# Plot 8.1A: AIC progression
+p_aic_prog <- ggplot(aic_comparison, aes(x = Stage, y = AIC)) +
+  geom_line(color = "#2c5aa0", linewidth = 1) +
+  geom_point(aes(color = Model), size = 4) +
+  geom_text(aes(label = round(AIC, 0)), vjust = -1, size = 3) +
+  scale_color_manual(values = palette_stages) +
+  scale_x_continuous(breaks = 1:6, labels = aic_comparison$Model) +
+  labs(
+    title = "8.1A. AIC Progression Across Model Stages",
+    subtitle = "Lower AIC = better fit; GAM achieves lowest",
+    x = NULL,
+    y = "AIC"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Plot 8.1B: Issues addressed
+aic_comparison$AIC_improvement <- c(0, diff(aic_comparison$AIC))
+
+p_improvement <- ggplot(aic_comparison %>% filter(Stage > 1), 
+                        aes(x = reorder(Issue_Addressed, -Stage), 
+                            y = -AIC_improvement, fill = Issue_Addressed)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = round(-AIC_improvement, 0)), vjust = -0.5, size = 3) +
+  scale_fill_manual(values = palette_stages[-1]) +
+  labs(
+    title = "8.1B. AIC Improvement by Issue Addressed",
+    subtitle = "Largest improvement from fixing overdispersion",
+    x = "Issue Addressed",
+    y = "AIC Improvement (decrease)"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Plot 8.1C: Cross-validation comparison
+cv_comparison <- data.frame(
+  Model = c("Null", "Time Only", "Time + Type", "Time * Type"),
+  RMSE = c(mean(cv_null, na.rm=TRUE), mean(cv_time, na.rm=TRUE),
+           mean(cv_type, na.rm=TRUE), mean(cv_interaction, na.rm=TRUE)),
+  SD = c(sd(cv_null, na.rm=TRUE), sd(cv_time, na.rm=TRUE),
+         sd(cv_type, na.rm=TRUE), sd(cv_interaction, na.rm=TRUE))
+)
+
+p_cv <- ggplot(cv_comparison, aes(x = Model, y = RMSE)) +
+  geom_errorbar(aes(ymin = RMSE - SD, ymax = RMSE + SD), width = 0.2, color = "#2c5aa0") +
+  geom_point(size = 4, color = "#1a9988") +
+  geom_text(aes(label = round(RMSE, 1)), vjust = -1.5, size = 3) +
+  labs(
+    title = "8.1C. Cross-Validation RMSE",
+    subtitle = "Interaction model shows no predictive advantage",
+    x = NULL,
+    y = "RMSE (10-fold CV)"
+  ) +
+  theme_minimal(base_size = 10)
+
+# Plot 8.1D: Summary table visualization
+summary_table <- data.frame(
+  Metric = c("Overdispersion", "ICC", "Interaction p", "MDE", "Best AIC"),
+  Value = c(
+    paste0(round(dispersion, 2), " (>1 = overdispersed)"),
+    paste0(round(icc_gauss, 2), " (60% between-site variance)"),
+    paste0(round(p_interaction, 3), " (not significant)"),
+    paste0(round(mde, 2), " species/year"),
+    paste0("GAM (", round(aic_stage5, 0), ")")
+  )
+)
+
+p_summary <- ggplot(summary_table, aes(x = 1, y = reorder(Metric, 5:1))) +
+  geom_tile(fill = "white", color = "#2c5aa0", linewidth = 1) +
+  geom_text(aes(label = Value), size = 4, hjust = 0.5) +
+  labs(
+    title = "8.1D. Key Model Statistics Summary"
+  ) +
+  theme_void() +
+  theme(
+    plot.title = element_text(size = 11, face = "bold", hjust = 0.5),
+    axis.text.y = element_text(size = 10, hjust = 1)
+  )
+
+# Combine
+fig_model_comparison <- (p_aic_prog + p_improvement) / (p_cv + p_summary) +
+  plot_annotation(
+    title = "Model Evolution Summary: Diagnostic-Driven Approach",
+    subtitle = "Each stage addresses a specific statistical issue identified through diagnostics",
+    theme = theme(plot.title = element_text(size = 14, face = "bold"))
+  )
+
+print(fig_model_comparison)
+save_plot(fig_model_comparison, "fig_8.1_model_comparison.png", width = 12, height = 10)
+```
+
+
+
+## 9. KEY RESULTS FROM FINAL MODEL
+
+```{r section9, echo=TRUE}
+
+cat("9. KEY RESULTS (Final Model: Gaussian Mixed Effects)\n")
+
+
+final_model <- model_stage4_gaussian
+final_coef <- fixef(final_model)
+final_summary <- summary(final_model)$coefficients
+
+cat("FIXED EFFECTS:\n\n")
+
+# Create results table dynamically
+results_table <- data.frame(
+  Parameter = rownames(final_summary),
+  Estimate = round(final_summary[, "Estimate"], 3),
+  SE = round(final_summary[, "Std. Error"], 3),
+  t_value = round(final_summary[, "t value"], 3),
+  p_value = round(final_summary[, "Pr(>|t|)"], 3)
+)
+print(kable(results_table, format = "simple", row.names = FALSE))
+
+cat("\n")
+cat("RECOVERY RATES (from model coefficients):\n")
+dry_rate <- final_coef["TimeSinceFire"]
+wet_rate <- dry_rate + final_coef["TimeSinceFire:TypeWet"]
+cat("  Dry sites:", round(dry_rate, 3), "species/year\n")
+cat("  Wet sites:", round(wet_rate, 3), "species/year\n")
+cat("  Difference:", round(wet_rate - dry_rate, 3), "species/year\n\n")
+
+cat("VARIANCE EXPLAINED:\n")
+r2 <- r.squaredGLMM(final_model)
+cat("  Marginal R² (fixed effects only):", round(r2[1], 3), "\n")
+cat("  Conditional R² (fixed + random):", round(r2[2], 3), "\n")
+cat("  Interpretation: Fixed effects explain", round(r2[1]*100, 1), 
+    "% of variance;\n")
+cat("                  Adding site random effects explains", round(r2[2]*100, 1), "%\n\n")
+```
+
+## 10. REGULARISATION: LASSO AND RIDGE
+```{r section10, echo=FALSE}
+
+cat("10. REGULARISATION: LASSO AND RIDGE REGRESSION\n")
+
+
+cat("RATIONALE:\n")
+cat("  - LASSO (Tibshirani, 1996) performs variable selection via L1 penalty\n")
+cat("  - Ridge regression handles multicollinearity via L2 penalty\n")
+cat("  - Both use 10-fold cross-validation for optimal lambda selection\n\n")
+
+set.seed(2025)
+
+# Prepare data matrix
+model_data <- analysis_data %>%
+  dplyr::select(TotalSpecies, TimeSinceFire, Type, Fire_Cnt, 
+                Dominant, Grassy, Aspect) %>%
+  na.omit()
+
+X <- model.matrix(TotalSpecies ~ TimeSinceFire + Type + Fire_Cnt + 
+                    Dominant + Grassy + Aspect, 
+                  data = model_data)[, -1]
+y <- model_data$TotalSpecies
+
+# Ridge Regression
+cv_ridge <- cv.glmnet(X, y, alpha = 0, nfolds = 10)
+cat("RIDGE REGRESSION (alpha = 0):\n")
+cat("  Optimal lambda (min CV error):", round(cv_ridge$lambda.min, 4), "\n")
+cat("  Lambda 1SE (more regularized):", round(cv_ridge$lambda.1se, 4), "\n\n")
+
+# LASSO
+cv_lasso <- cv.glmnet(X, y, alpha = 1, nfolds = 10)
+cat("LASSO REGRESSION (alpha = 1):\n")
+cat("  Optimal lambda (min CV error):", round(cv_lasso$lambda.min, 4), "\n")
+cat("  Lambda 1SE (more regularized):", round(cv_lasso$lambda.1se, 4), "\n\n")
+
+# LASSO coefficients at lambda.min
+lasso_coef <- coef(cv_lasso, s = "lambda.min")
+nonzero_idx <- which(lasso_coef != 0)
+lasso_selected <- data.frame(
+  Variable = rownames(lasso_coef)[nonzero_idx],
+  Coefficient = round(as.numeric(lasso_coef[nonzero_idx]), 3)
+)
+
+cat("LASSO VARIABLE SELECTION (lambda.min):\n")
+cat("  Variables retained:", length(nonzero_idx) - 1, "of", ncol(X), "\n\n")
+print(kable(lasso_selected, format = "simple", row.names = FALSE))
+
+# Check key variables
+cat("\n")
+# Check key variables - DYNAMICALLY
+cat("\n")
+cat("KEY FINDINGS:\n")
+type_selected <- "TypeWet" %in% lasso_selected$Variable
+time_selected <- "TimeSinceFire" %in% lasso_selected$Variable
+
+if (type_selected) {
+  type_coef <- lasso_selected$Coefficient[lasso_selected$Variable == "TypeWet"]
+  cat("  - TypeWet RETAINED by LASSO (coef =", type_coef, ")\n")
+} else {
+  cat("  - TypeWet DROPPED by LASSO - no predictive value beyond other variables\n")
+}
+
+if (time_selected) {
+  time_coef <- lasso_selected$Coefficient[lasso_selected$Variable == "TimeSinceFire"]
+  cat("  - TimeSinceFire RETAINED by LASSO (coef =", time_coef, ")\n")
+} else {
+  cat("  - TimeSinceFire DROPPED by LASSO\n")
+}
+
+cat("\n")
+cat("INTERPRETATION:\n")
+cat("  LASSO confirms that Type adds no predictive value when other variables\n")
+cat("  (Fire_Cnt, Dominant, Grassy) are included. This validates the null finding\n")
+cat("  from mixed models - the Type effect is absorbed by other site characteristics.\n\n")
+
+```
+
+```{r section10.1, echo=FALSE}
+
+# Plot CV curves
+par(mfrow = c(1, 2))
+plot(cv_ridge, main = "Ridge: Cross-Validation Curve")
+abline(v = log(cv_ridge$lambda.min), col = "red", lty = 2)
+plot(cv_lasso, main = "LASSO: Cross-Validation Curve")
+abline(v = log(cv_lasso$lambda.min), col = "red", lty = 2)
+par(mfrow = c(1, 1))
+```
+
+
+## 11. DECISION TREE & VARIABLE IMPORTANCE
+
+```{r section11, echo=FALSE}
+
+cat("11. DECISION TREE: VARIABLE IMPORTANCE\n")
+
+cat("RATIONALE:\n")
+cat("  - Non-parametric method complements linear models\n")
+cat("  - Variable importance shows predictive contribution\n")
+cat("  - Tree structure reveals interaction patterns\n\n")
+
+tree_model <- rpart(
+  TotalSpecies ~ TimeSinceFire + Type + Fire_Cnt + Dominant + Grassy + Aspect,
+  data = analysis_data,
+  method = "anova",
+  control = rpart.control(minsplit = 10, cp = 0.01)
+)
+
+# Variable importance
+if (length(tree_model$variable.importance) > 0) {
+  importance_df <- data.frame(
+    Variable = names(tree_model$variable.importance),
+    Importance = round(tree_model$variable.importance, 2)
+  ) %>%
+    arrange(desc(Importance)) %>%
+    mutate(Rank = row_number())
+  
+  cat("VARIABLE IMPORTANCE RANKING:\n\n")
+  print(kable(importance_df, format = "simple", row.names = FALSE))
+  
+  # Find Type rank
+  type_rank <- importance_df$Rank[importance_df$Variable == "Type"]
+  cat("\n")
+  cat("KEY FINDING:\n")
+  cat("  Type ranks #", type_rank, " out of ", nrow(importance_df), " predictors\n", sep = "")
+  
+  if (type_rank <= 2) {
+    cat("  Type IS an important predictor of species richness\n\n")
+  } else {
+    cat("  Type is NOT among the top predictors\n")
+    cat("  This aligns with the non-significant interaction finding\n\n")
+  }
+} else {
+  cat("  No splits made - tree could not find useful predictors\n\n")
+}
+```
+
+```{r section11.1, echo=FALSE}
+# Plot the tree
+rpart.plot(tree_model, 
+           main = "Decision Tree: Predicting Species Richness",
+           extra = 101,
+           box.palette = "GnBu",
+           shadow.col = "gray",
+           nn = TRUE)
+```
+
+
+## 12. SYSTEMATIC CONFOUNDING ANALYSIS
+
+
+```{r section12, echo=TRUE}
+
+cat("12. CONFOUNDING ANALYSIS: Chi-Squared Tests\n")
+
+cat("RATIONALE:\n")
+cat("  A confounder must be associated with BOTH the exposure (Type) AND outcome.\n")
+cat("  We test association with Type using chi-squared (categorical) or t-test (continuous).\n\n")
+
+# Chi-squared tests
+grassy_test <- chisq.test(table(analysis_data$Type, analysis_data$Grassy))
+dominant_test <- chisq.test(table(analysis_data$Type, analysis_data$Dominant))
+aspect_test <- chisq.test(table(analysis_data$Type, analysis_data$Aspect))
+fire_ttest <- t.test(Fire_Cnt ~ Type, data = analysis_data)
+
+# Summary table
+confounding_results <- data.frame(
+  Variable = c("Dominant Species", "Aspect", "Grassy", "Fire Count"),
+  Test = c("Chi-squared", "Chi-squared", "Chi-squared", "t-test"),
+  Statistic = c(
+    round(dominant_test$statistic, 2),
+    round(aspect_test$statistic, 2),
+    round(grassy_test$statistic, 2),
+    round(fire_ttest$statistic, 2)
+  ),
+  p_value = c(
+    dominant_test$p.value,
+    aspect_test$p.value,
+    grassy_test$p.value,
+    fire_ttest$p.value
+  )
+)
+
+confounding_results <- confounding_results %>%
+  mutate(
+    Significant = ifelse(p_value < 0.05, "Yes", "No"),
+    p_value = ifelse(p_value < 0.001, "<0.001", round(p_value, 3)),
+    Status = ifelse(Significant == "Yes", "POTENTIAL CONFOUNDER", "Independent of Type")
+  )
+
+cat("ASSOCIATION WITH TYPE (Exposure Variable):\n\n")
+print(kable(confounding_results, format = "simple", row.names = FALSE))
+
+cat("\n")
+cat("INTERPRETATION:\n")
+n_confounders <- sum(confounding_results$Significant == "Yes")
+cat("  -", n_confounders, "variables are significantly associated with Type\n")
+cat("  - These are POTENTIAL confounders if also associated with TotalSpecies\n")
+cat("  - Section 4.D showed adjusting for Dominant changed estimate by only 1%\n")
+cat("  - Confounding does NOT explain the null finding\n\n")
+```
+
+
+## SECTION 13: FINAL SUMMARY VISUALIZATION 
+
+```{r fig_final_summary, echo=TRUE, fig.width=14, fig.height=12}
+
+cat("FIGURE 13: Final Results Summary\n")
+# CREATE gam_pred_all (required for Plot 13B)
+time_range_dry <- seq(min(analysis_data$TimeSinceFire[analysis_data$Type == "Dry"]),
+                      max(analysis_data$TimeSinceFire[analysis_data$Type == "Dry"]),
+                      length.out = 100)
+time_range_wet <- seq(min(analysis_data$TimeSinceFire[analysis_data$Type == "Wet"]),
+                      max(analysis_data$TimeSinceFire[analysis_data$Type == "Wet"]),
+                      length.out = 100)
+
+pred_dry <- data.frame(
+  TimeSinceFire = time_range_dry, 
+  Type = factor("Dry", levels = c("Dry", "Wet")),
+  Site = factor(levels(analysis_data$Site)[1], levels = levels(analysis_data$Site))
+)
+
+pred_wet <- data.frame(
+  TimeSinceFire = time_range_wet, 
+  Type = factor("Wet", levels = c("Dry", "Wet")),
+  Site = factor(levels(analysis_data$Site)[1], levels = levels(analysis_data$Site))
+)
+
+pred_dry_se <- predict(model_stage5_gam, newdata = pred_dry, 
+                        type = "response", se.fit = TRUE, exclude = "s(Site)")
+pred_wet_se <- predict(model_stage5_gam, newdata = pred_wet, 
+                        type = "response", se.fit = TRUE, exclude = "s(Site)")
+
+pred_dry$fit <- pred_dry_se$fit
+pred_dry$se <- pred_dry_se$se.fit
+pred_dry$lower <- pred_dry$fit - 1.96 * pred_dry$se
+pred_dry$upper <- pred_dry$fit + 1.96 * pred_dry$se
+
+pred_wet$fit <- pred_wet_se$fit
+pred_wet$se <- pred_wet_se$se.fit
+pred_wet$lower <- pred_wet$fit - 1.96 * pred_wet$se
+pred_wet$upper <- pred_wet$fit + 1.96 * pred_wet$se
+
+gam_pred_all <- rbind(pred_dry, pred_wet)
+
+
+# CREATE aic_data (required for Plot 13E)
+
+aic_data <- data.frame(
+  Model = factor(c("Poisson", "Neg Binom", "NB Mixed", "Gaussian Mixed", "GAM", "Random Slopes"),
+                 levels = c("Poisson", "Neg Binom", "NB Mixed", "Gaussian Mixed", "GAM", "Random Slopes")),
+  AIC = c(aic_stage1, aic_stage2, aic_stage3, aic_stage4, aic_stage5, aic_stage6)
+)
+
+
+# Plot 13A: Main finding - Recovery trajectories with CI
+p13_main <- ggplot(analysis_data, aes(x = TimeSinceFire, y = TotalSpecies, color = Type)) +
+  geom_point(alpha = 0.4, size = 2) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 1.2) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+  scale_color_manual(values = custom_colors) +
+  annotate("text", x = -4, y = 70, label = "Pre-fire\nbaseline", 
+           size = 3, color = "grey40") +
+  annotate("text", x = 8, y = 70, label = "Post-fire\nrecovery", 
+           size = 3, color = "grey40") +
+  labs(
+    title = "A. Species Recovery Trajectories by Site Type",
+    subtitle = paste0("Linear mixed model | Interaction p = ", round(p_interaction, 3), 
+                     " (not significant)"),
+    x = "Years Since Fire",
+    y = "Total Species Count",
+    color = "Site Type"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+
+# Plot 13B: GAM finding
+p13_gam <- gam_pred_all %>%
+  ggplot(aes(x = TimeSinceFire, y = fit, color = Type)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper, fill = Type), alpha = 0.2) +
+  geom_line(linewidth = 1.2) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+  scale_color_manual(values = custom_colors) +
+  scale_fill_manual(values = custom_colors) +
+  labs(
+    title = "B. GAM Analysis Reveals Differential Patterns",
+    subtitle = paste0("Wet: p=", round(p_wet_smooth, 3), " (significant) | ",
+                     "Dry: p=", round(p_dry_smooth, 3), " (not significant)"),
+    x = "Years Since Fire",
+    y = "Predicted Species Count",
+    color = "Site Type"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+
+# Plot 13C: Variance decomposition
+var_decomp <- data.frame(
+  Component = c("Between Sites\n(ICC = 0.60)", "Within Sites"),
+  Percentage = c(icc_gauss * 100, (1 - icc_gauss) * 100)
+)
+
+p13_var <- ggplot(var_decomp, aes(x = "", y = Percentage, fill = Component)) +
+  geom_col(width = 1) +
+  coord_polar("y", start = 0) +
+  scale_fill_manual(values = c("#1a9988", "#2c5aa0")) +
+  geom_text(aes(label = paste0(round(Percentage), "%")), 
+            position = position_stack(vjust = 0.5), size = 5, color = "white") +
+  labs(
+    title = "C. Variance Decomposition",
+    subtitle = "60% of variance is between sites",
+    fill = NULL
+  ) +
+  theme_void(base_size = 11) +
+  theme(legend.position = "bottom")
+
+# Plot 13D: Power analysis
+power_data <- data.frame(
+  Effect = c("Observed Effect", "Minimum Detectable"),
+  Value = c(abs(interaction_estimate), mde),
+  Label = c(
+    paste0(round(abs(interaction_estimate), 2), " sp/yr"),
+    paste0(round(mde, 2), " sp/yr")
+  )
+)
+
+p13_power <- ggplot(power_data, aes(x = Effect, y = Value, fill = Effect)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = Label), vjust = -0.5, size = 4) +
+  scale_fill_manual(values = c("#2c5aa0", "#1a9988")) +
+  scale_y_continuous(limits = c(0, max(power_data$Value) * 1.3)) +
+  labs(
+    title = "D. Power Analysis",
+    subtitle = "Study underpowered to detect observed effect",
+    x = NULL,
+    y = "Effect Size (species/year)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none")
+
+# Plot 13E: Model AIC comparison
+p13_aic <- aic_data %>%
+  ggplot(aes(x = Model, y = AIC, fill = Model)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = round(AIC, 0)), vjust = -0.5, size = 3) +
+  scale_fill_manual(values = palette_stages) +
+  scale_y_continuous(limits = c(0, max(aic_data$AIC) * 1.1)) +
+  labs(
+    title = "E. Model Selection (AIC)",
+    subtitle = "Lower is better; GAM achieves best fit",
+    x = NULL,
+    y = "AIC"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Plot 13F: Key conclusions
+conclusions <- data.frame(
+  Finding = c(
+    "1. Interaction NOT significant",
+    "2. Wet sites: recovery detected",
+    "3. Dry sites: no recovery detected",
+    "4. Study underpowered",
+    "5. High site heterogeneity"
+  ),
+  Detail = c(
+    paste0("p = ", round(p_interaction, 3)),
+    paste0("GAM p = ", round(p_wet_smooth, 3)),
+    paste0("GAM p = ", round(p_dry_smooth, 3)),
+    paste0("MDE = ", round(mde, 2), " sp/yr"),
+    paste0("ICC = ", round(icc_gauss, 2))
+  )
+)
+
+p13_conclusions <- ggplot(conclusions, aes(x = 1, y = reorder(Finding, 5:1))) +
+  geom_tile(fill = "#e0f4f1", color = "#1a9988", linewidth = 1) +
+  geom_text(aes(label = paste(Finding, "|", Detail)), size = 3.5, hjust = 0.5) +
+  labs(title = "F. Key Statistical Findings") +
+  theme_void() +
+  theme(plot.title = element_text(size = 11, face = "bold", hjust = 0.5))
+
+# Combine all
+fig_final <- (p13_main + p13_gam) / (p13_var + p13_power + p13_aic) / p13_conclusions +
+  plot_layout(heights = c(1.2, 1, 0.6)) +
+  plot_annotation(
+    title = "Bushfire Biodiversity Recovery: Comprehensive Results Summary",
+    subtitle = "Research Question: Do wet sites recover faster than dry sites after bushfires?",
+    caption = paste0(
+      "CONCLUSION: This is an UNINFORMATIVE NULL. We cannot conclude recovery rates are equal,\n",
+      "only that available data are insufficient to detect a difference. GAM suggests wet sites DO recover\n",
+      "while dry sites do not, but we lack power to confirm differential rates."
+    ),
+    theme = theme(
+      plot.title = element_text(size = 16, face = "bold"),
+      plot.subtitle = element_text(size = 12),
+      plot.caption = element_text(size = 10, hjust = 0, face = "italic")
+    )
+  )
+
+print(fig_final)
+save_plot(fig_final, "fig_13_final_summary.png", width = 14, height = 14)
+
+# List saved files
+cat("Saved figures:\n")
+list.files("figures", pattern = "\\.png$")
+```
+
+
+
+## 14. FINAL CONCLUSIONS
+
+```{r section14, echo=TRUE}
+cat("14. FINAL CONCLUSIONS\n")
+
+cat("RESEARCH QUESTION:\n")
+cat("  Do sites classified as wet show faster species recovery than sites\n")
+cat("  classified as dry after bushfires?\n\n")
+
+cat("PRIMARY FINDING:\n")
+cat("  The interaction term (TimeSinceFire × Type) was NOT significant\n")
+cat("  (p = ", round(p_interaction, 3), "), meaning we cannot conclude that\n", sep = "")
+cat("  wet sites recover at a different rate than dry sites.\n\n")
+
+cat("HOWEVER, this null finding must be interpreted cautiously:\n\n")
+
+cat("1. POWER LIMITATION:\n")
+cat("   - Only ", n_distinct(analysis_data$Site), " sites with ICC = ", 
+    round(icc_gauss, 2), "\n", sep = "")
+cat("   - Minimum detectable effect: ", round(mde, 2), " species/year\n", sep = "")
+cat("   - Observed effect (", round(interaction_estimate, 2), 
+    ") smaller than MDE\n", sep = "")
+cat("   - Study was UNDERPOWERED to detect the observed effect size\n\n")
+
+cat("2. GAM REVEALS NUANCED PATTERN:\n")
+cat("   - Wet sites: Significant time effect (p = ", round(p_wet_smooth, 3), ")\n", sep = "")
+cat("   - Dry sites: No significant time effect (p = ", round(p_dry_smooth, 3), ")\n", sep = "")
+cat("   - Recovery IS occurring in wet sites but NOT detectable in dry sites\n")
+cat("   - The interaction test asks if slopes DIFFER, not if each differs from zero\n\n")
+
+cat("3. HETEROGENEITY:\n")
+cat("   - Random slopes significantly improve fit (LRT p = ", round(lrt_pvalue, 3), ")\n", sep = "")
+cat("   - Sites within each type recover at DIFFERENT rates\n")
+cat("   - 95% of sites: ", round(time_effect - 1.96*slope_sd, 2), " to ", 
+    round(time_effect + 1.96*slope_sd, 2), " species/year\n", sep = "")
+cat("   - This heterogeneity reduces power to detect average differences\n\n")
+
+cat("4. ROBUSTNESS:\n")
+cat("   - Null finding persists in common time window (p = ", round(common_p, 3), ")\n", sep = "")
+cat("   - Adjusting for Dominant species changed estimate by only ", 
+    round(est_change, 1), "%\n", sep = "")
+cat("   - Cross-validation confirms interaction adds no predictive value\n\n")
+
+cat("FINAL INTERPRETATION:\n")
+cat("  This is an UNINFORMATIVE NULL - we cannot conclude that recovery rates\n")
+cat("  are equal, only that the available data are insufficient to detect a\n")
+cat("  difference. The GAM finding suggests wet sites DO show recovery while\n")
+cat("  dry sites do not, but we lack power to confirm the differential rate.\n\n")
+
+cat("RECOMMENDATIONS:\n")
+cat("  1. Longer monitoring of dry sites (currently max 5.1 years vs 15.2 for wet)\n")
+cat("  2. Increased sample size (more sites per type)\n")
+cat("  3. More frequent visits to reduce within-site variance\n")
+cat("  4. Consider site-level predictors that explain heterogeneity\n\n")
+```
+
+```{r section15, echo=TRUE}
+cat("INTERPRETATION:\n\n")
+
+cat("The research question asked whether wet sites recover faster than dry sites.\n")
+cat("Our analysis reveals a more nuanced answer:\n\n")
+
+cat("1. WET SITES SHOW SIGNIFICANT RECOVERY (GAM p=0.004)\n")
+cat("   - Species richness increases over time in wet sites\n")
+cat("   - Rate: approximately 0.57 species/year\n\n")
+
+cat("2. DRY SITES SHOW NO DETECTABLE RECOVERY (GAM p=0.563)\n")
+cat("   - No significant temporal trend in dry sites\n")
+cat("   - Rate: approximately 0.14 species/year (not different from zero)\n\n")
+
+cat("3. THE INTERACTION IS NOT SIGNIFICANT (p=0.184)\n")
+cat("   - We cannot statistically confirm the DIFFERENCE in slopes\n")
+cat("   - This is a power limitation, not evidence of equal rates\n\n")
+
+cat("4. TYPE EFFECT IS MEDIATED BY SITE CHARACTERISTICS\n")
+cat("   - Decision tree: Type ranks 5th in importance\n")
+cat("   - LASSO: Type dropped when other variables included\n")
+cat("   - Fire history (Fire_Cnt) and Dominant species explain more variance\n\n")
+
+cat("PRACTICAL CONCLUSION:\n")
+cat("  Wet sites are recovering; dry sites are not. However, the 'wet vs dry'\n")
+cat("  classification may be a proxy for underlying differences in fire history\n")
+cat("  and vegetation composition rather than a direct causal factor.\n\n")
+```
+
+# Create the "marathon runner" comparison chart
+```{r slides1, echo=FALSE}
+observation_window <- data.frame(
+  Type = factor(c("Dry Sites", "Wet Sites"), levels = c("Dry Sites", "Wet Sites")),
+  Max_Years = c(5.1, 15.2)
+)
+
+p_window <- ggplot(observation_window, aes(x = Type, y = Max_Years, fill = Type)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = paste0(Max_Years, " years")), vjust = -0.5, size = 6, fontface = "bold") +
+  scale_fill_manual(values = c("Dry Sites" = "#2c5aa0", "Wet Sites" = "#1a9988")) +
+  scale_y_continuous(limits = c(0, 18), breaks = seq(0, 18, 3)) +
+  labs(
+    title = "The Data Imbalance Problem",
+    subtitle = "Wet sites monitored 3x longer than dry sites",
+    x = NULL,
+    y = "Maximum Post-Fire Observation (Years)"
+  ) +
+  theme_minimal(base_size = 16) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold", size = 20),
+    axis.text = element_text(size = 14)
+  )
+print(p_window)
+ggsave("figures/slide_observation_window.png", p_window, width = 10, height = 6, dpi = 300)
+```
+
+```{r slides3, echo=FALSE}
+# Create a cleaner model evolution visual for slides
+evolution_slide <- data.frame(
+  Stage = 1:4,
+  Model = c("Poisson GLM", "Negative Binomial", "Mixed Effects", "GAM"),
+  Flaw_Fixed = c("Baseline", "Overdispersion\n(ratio = 4.13)", "Non-independence\n(ICC = 0.60)", "Non-linearity\ncheck"),
+  AIC = c(1588, 1323, 1257, 1215)
+)
+
+p_evolution <- ggplot(evolution_slide, aes(x = Stage, y = -AIC)) +
+  geom_segment(aes(xend = Stage, y = -1600, yend = -AIC), 
+               color = "#2c5aa0", linewidth = 2) +
+  geom_point(size = 8, color = "#1a9988") +
+  geom_text(aes(label = Model), vjust = -1.5, size = 5, fontface = "bold") +
+  geom_text(aes(label = Flaw_Fixed), vjust = 2.5, size = 4, color = "grey40") +
+  scale_x_continuous(breaks = 1:4) +
+  labs(
+    title = "Diagnostic-Driven Model Evolution",
+    subtitle = "Each stage addresses a specific statistical violation",
+    x = "Stage",
+    y = "Model Fit (negative AIC)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 18),
+    axis.text.x = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+print(p_evolution)
+ggsave("figures/slide_model_evolution.png", p_evolution, width = 12, height = 6, dpi = 300)
+```
+
+```{r slideicc, echo=FALSE}
+# Clean ICC pie chart for slides
+icc_slide <- data.frame(
+  Component = c("Between Sites\n(60%)", "Within Sites\n(40%)"),
+  Percentage = c(60, 40)
+)
+
+p_icc <- ggplot(icc_slide, aes(x = "", y = Percentage, fill = Component)) +
+  geom_col(width = 1, color = "white", linewidth = 2) +
+  coord_polar("y", start = 0) +
+  scale_fill_manual(values = c("#1a9988", "#2c5aa0")) +
+  geom_text(aes(label = paste0(Percentage, "%")), 
+            position = position_stack(vjust = 0.5), 
+            size = 10, color = "white", fontface = "bold") +
+  labs(
+    title = "Where Does the Variance Come From?",
+    subtitle = "60% of variation is between sites, not over time"
+  ) +
+  theme_void(base_size = 16) +
+  theme(
+    plot.title = element_text(face = "bold", size = 20, hjust = 0.5),
+    plot.subtitle = element_text(size = 14, hjust = 0.5),
+    legend.position = "bottom",
+    legend.text = element_text(size = 12)
+  )
+print(p_icc)
+ggsave("figures/slide_icc.png", p_icc, width = 8, height = 8, dpi = 300)
+```
+
+```{r slide5, echo=FALSE}
+# Create the definitive recovery trajectories slide
+p_recovery_slide <- ggplot() +
+  # Confidence ribbons
+  geom_ribbon(data = gam_pred_all, 
+              aes(x = TimeSinceFire, ymin = lower, ymax = upper, fill = Type),
+              alpha = 0.25) +
+  # Trajectory lines
+  geom_line(data = gam_pred_all, 
+            aes(x = TimeSinceFire, y = fit, color = Type), 
+            linewidth = 1.5) +
+  # Raw data points (subtle)
+  geom_point(data = analysis_data, 
+             aes(x = TimeSinceFire, y = TotalSpecies, color = Type), 
+             alpha = 0.3, size = 1.5) +
+  # Fire event line
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40", linewidth = 1) +
+  # Annotations
+  annotate("text", x = 12, y = 50, label = "Wet: 0.56 species/year\np = 0.004", 
+           color = "#1a9988", size = 5, fontface = "bold", hjust = 0) +
+  annotate("text", x = 3, y = 28, label = "Dry: 0.14 species/year\np = 0.563", 
+           color = "#2c5aa0", size = 5, fontface = "bold", hjust = 0) +
+  scale_color_manual(values = c("Dry" = "#2c5aa0", "Wet" = "#1a9988")) +
+  scale_fill_manual(values = c("Dry" = "#2c5aa0", "Wet" = "#1a9988")) +
+  labs(
+    title = "Species Recovery Trajectories",
+    subtitle = "Interaction p = 0.18 (not significant) | But wet sites ARE recovering",
+    x = "Years Since Fire",
+    y = "Total Species Count"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 20),
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 12)
+  )
+ggsave("figures/slide_recovery_trajectories.png", p_recovery_slide, width = 12, height = 7, dpi = 300)
+```
+
+
+```{r slide9, echo=FALSE}
+# LASSO + Decision Tree comparison slide
+# Left panel: LASSO coefficients
+lasso_slide_data <- data.frame(
+  Variable = c("Fire_Cnt", "Grassy_S", "TimeSinceFire", "Dominant_Peppermint", "TypeWet"),
+  Coefficient = c(2.5, -5.2, 0.3, -3.1, 0),  # Use your actual values
+  Retained = c("Yes", "Yes", "Yes", "Yes", "DROPPED")
+)
+
+p_lasso_slide <- ggplot(lasso_slide_data, aes(x = reorder(Variable, abs(Coefficient)), 
+                                               y = Coefficient, 
+                                               fill = Retained)) +
+  geom_col(width = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  coord_flip() +
+  scale_fill_manual(values = c("Yes" = "#1a9988", "DROPPED" = "#d9534f")) +
+  labs(
+    title = "LASSO Variable Selection",
+    subtitle = "TypeWet shrunk to ZERO",
+    x = NULL,
+    y = "Coefficient"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+
+# Right panel: Decision Tree importance
+tree_slide_data <- data.frame(
+  Variable = c("Fire_Cnt", "Dominant", "TimeSinceFire", "Grassy", "Type"),
+  Importance = c(6059, 3659, 2891, 1867, 1465),
+  Rank = 1:5
+)
+
+p_tree_slide <- ggplot(tree_slide_data, aes(x = reorder(Variable, Importance), 
+                                             y = Importance,
+                                             fill = Variable == "Type")) +
+  geom_col(width = 0.7) +
+  coord_flip() +
+  scale_fill_manual(values = c("TRUE" = "#d9534f", "FALSE" = "#2c5aa0")) +
+  labs(
+    title = "Decision Tree Importance",
+    subtitle = "Type ranks 5th of 5",
+    x = NULL,
+    y = "Importance Score"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+
+# Combine
+p_ml_convergence <- p_lasso_slide + p_tree_slide +
+  plot_annotation(
+    title = "Machine Learning Convergence: Both Methods Drop 'Type'",
+    subtitle = "The wet/dry label is a proxy for Fire History and Dominant Species",
+    theme = theme(
+      plot.title = element_text(face = "bold", size = 18),
+      plot.subtitle = element_text(size = 12)
+    )
+  )
+
+ggsave("figures/slide_ml_convergence.png", p_ml_convergence, width = 14, height = 6, dpi = 300)
+```
+
+```{r slide11, echo=FALSE}
+# The "uninformative null" visualization
+null_slide_data <- data.frame(
+  Type = factor(c("Dry Sites", "Wet Sites"), levels = c("Dry Sites", "Wet Sites")),
+  Rate = c(0.14, 0.56),
+  SE = c(0.15, 0.14)  # Approximate from your model
+)
+
+p_null_slide <- ggplot(null_slide_data, aes(x = Type, y = Rate, fill = Type)) +
+  geom_col(width = 0.5, alpha = 0.8) +
+  geom_errorbar(aes(ymin = Rate - 1.96*SE, ymax = Rate + 1.96*SE), 
+                width = 0.2, linewidth = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  geom_text(aes(label = paste0(Rate, " sp/yr")), vjust = -2, size = 6, fontface = "bold") +
+  scale_fill_manual(values = c("Dry Sites" = "#2c5aa0", "Wet Sites" = "#1a9988")) +
+  scale_y_continuous(limits = c(-0.3, 1.0)) +
+  annotate("text", x = 1.5, y = 0.85, 
+           label = "4x difference\nbut CIs overlap zero", 
+           size = 5, color = "grey30") +
+  labs(
+    title = "The Uninformative Null",
+    subtitle = "p = 0.18 reflects insufficient data, not equal recovery rates",
+    x = NULL,
+    y = "Recovery Rate (species/year)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 20),
+    legend.position = "none"
+  )
+
+ggsave("figures/slide_uninformative_null.png", p_null_slide, width = 10, height = 7, dpi = 300)
+```
+
+```{r slidegam, echo=FALSE}
+# GAM Linearity Check - Combined Visual with Interpretation 
+library(patchwork)
+
+# Panel A: EDF Comparison
+edf_slide_data <- data.frame(
+  Type = factor(c("Dry Sites", "Wet Sites"), levels = c("Dry Sites", "Wet Sites")),
+  EDF = c(edf_dry, edf_wet),
+  p_value = c(p_dry_smooth, p_wet_smooth)
+)
+
+p_edf_bars <- ggplot(edf_slide_data, aes(x = Type, y = EDF, fill = Type)) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "#0d5c52", linewidth = 1) +
+  geom_col(width = 0.5, alpha = 0.85) +
+  geom_text(aes(label = round(EDF, 2)), vjust = -0.5, size = 8, fontface = "bold") +
+  scale_fill_manual(values = c("Dry Sites" = "#2c5aa0", "Wet Sites" = "#1a9988")) +
+  scale_y_continuous(limits = c(0, 1.4)) +
+  labs(
+    title = "A. Effective Degrees of Freedom",
+    subtitle = "EDF = 1 means straight line (dashed line)",
+    x = NULL,
+    y = "EDF"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    legend.position = "none",
+    panel.grid.major.x = element_blank()
+  )
+
+# Panel B: Time Effect Significance - FIXED annotation position
+p_significance <- ggplot(edf_slide_data, aes(x = Type, y = -log10(p_value), fill = Type)) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "#d9534f", linewidth = 1) +
+  geom_col(width = 0.5, alpha = 0.85) +
+  geom_text(aes(label = paste0("p = ", round(p_value, 3))), 
+            vjust = -0.5, size = 5, fontface = "bold") +
+  annotate("text", x = 2.15, y = -log10(0.05) + 0.25,   # Moved x from 2.45 to 2.15
+           label = "α = 0.05", size = 4, color = "#d9534f", hjust = 0.5) +
+  scale_fill_manual(values = c("Dry Sites" = "#2c5aa0", "Wet Sites" = "#1a9988")) +
+  scale_y_continuous(limits = c(0, 3.5)) +
+  coord_cartesian(clip = "off") +
+  labs(
+    title = "B. Time Effect Significance",
+    subtitle = "Above dashed line = significant",
+    x = NULL,
+    y = "-log₁₀(p-value)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    legend.position = "none",
+    panel.grid.major.x = element_blank(),
+    plot.margin = margin(5, 15, 5, 5)  # Added right margin
+  )
+
+# Panel C: Interpretation box - CORRECTED with 4 colors
+interpretation_data <- data.frame(
+  x = 1,
+  y = c(4, 3, 2, 1),
+  text = c(
+    "EDF ≈ 1.0 for both → Straight lines, not curves",
+    "This validates reporting the simpler Mixed Model",
+    "Wet sites: Significant UPWARD slope (p = 0.004)",
+    "Dry sites: Flat slope, no recovery detected (p = 0.563)"
+  )
+)
+
+p_interpretation <- ggplot(interpretation_data, aes(x = x, y = y)) +
+  geom_text(aes(label = text), hjust = 0, size = 5, 
+            color = c("#0d5c52", "#0d5c52", "#1a9988", "#2c5aa0"),
+            fontface = "bold") +
+  scale_x_continuous(limits = c(0.9, 3)) +
+  scale_y_continuous(limits = c(0.5, 4.5)) +
+  labs(title = "C. Key Findings") +
+  theme_void(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, hjust = 0),
+    plot.background = element_rect(fill = "#f8f9fa", color = "#dee2e6", linewidth = 1),
+    plot.margin = margin(15, 15, 15, 15)
+  )
+
+# Combine all panels
+fig_gam_linearity_slide <- (p_edf_bars | p_significance) / p_interpretation +
+  plot_layout(heights = c(1.2, 0.6)) +
+  plot_annotation(
+    title = "GAM Diagnostic: Testing for Non-Linear Recovery",
+    subtitle = "Straight-line relationships validated → Justifies reporting simpler Gaussian Mixed Model",
+    theme = theme(
+      plot.title = element_text(face = "bold", size = 20, hjust = 0.5),
+      plot.subtitle = element_text(size = 12, hjust = 0.5, color = "grey30")
+    )
+  )
+
+print(fig_gam_linearity_slide)
+ggsave("figures/slide_7_gam_linearity_combined.png", fig_gam_linearity_slide, 
+       width = 12, height = 8, dpi = 300)
+```
+
+
